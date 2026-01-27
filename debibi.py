@@ -19,6 +19,9 @@ Notes:
 from __future__ import annotations
 
 import sys
+import os
+import json
+import math
 import sqlite3
 import uuid
 import datetime as dt
@@ -27,12 +30,18 @@ from typing import Optional, List, Dict, Tuple, Any
 
 from PySide6.QtCore import Qt, QSize, QDate
 from PySide6.QtGui import QAction, QFont
+from PySide6.QtCore import (
+    Qt, QSize, QDate, QByteArray, QBuffer, QIODevice, QPointF, QRectF, QSizeF
+)
+from PySide6.QtGui import (
+    QAction, QFont, QPixmap, QImage, QPainter
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QStackedWidget, QTabWidget, QToolButton, QMessageBox,
     QDialog, QFormLayout, QLineEdit, QTextEdit, QDateEdit, QComboBox, QDoubleSpinBox,
-    QTableWidget, QAbstractItemView, QHeaderView, QCheckBox, QMenuBar,
-    QSizePolicy
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QCheckBox, QMenuBar,
+    QSizePolicy, QFileDialog
 )
 
 
@@ -68,6 +77,13 @@ EXPENSE_ICON_BY_CODE = {
     "5000000010": "🧩",
 }
 
+# Optional PDF rendering (for attachment thumbnails)
+try:
+    from PySide6.QtPdf import QPdfDocument
+    PDF_RENDER_AVAILABLE = True
+except Exception:
+    PDF_RENDER_AVAILABLE = False
+
 def bs_icon(account_code: str, account_type: str) -> str:
     if account_code == "0000000001":
         return "💵"
@@ -93,6 +109,59 @@ def iso_to_qdate(s: str) -> QDate:
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+# -------------------------
+# Attachments / MIME helpers
+# -------------------------
+
+ATTACH_MAX_BYTES = 10 * 1024 * 1024  # 10MB
+ALLOWED_MIME = {"image/jpeg", "image/png", "application/pdf"}
+
+def guess_mime_from_path(path: str) -> Optional[str]:
+    ext = path.lower().rsplit(".", 1)
+    if len(ext) < 2:
+        return None
+    ext = ext[1]
+    if ext in ("jpg", "jpeg"):
+        return "image/jpeg"
+    if ext == "png":
+        return "image/png"
+    if ext == "pdf":
+        return "application/pdf"
+    return None
+
+def pixmap_from_image_bytes(data: bytes, max_size: QSize) -> Optional[QPixmap]:
+    img = QImage.fromData(data)
+    if img.isNull():
+        return None
+    if max_size.width() > 0 and max_size.height() > 0:
+        img = img.scaled(max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return QPixmap.fromImage(img)
+
+def pixmap_from_pdf_bytes(data: bytes, max_size: QSize) -> Optional[QPixmap]:
+    if not PDF_RENDER_AVAILABLE:
+        return None
+    doc = QPdfDocument()
+    buf = QBuffer()
+    buf.setData(QByteArray(data))
+    buf.open(QIODevice.ReadOnly)
+    err = doc.load(buf)
+    try:
+        ok_value = QPdfDocument.Error.NoError  # Qt 6.5+
+    except AttributeError:
+        ok_value = getattr(QPdfDocument, "NoError", 0)  # older enum style
+    if err != ok_value or doc.pageCount() == 0:
+        return None
+    page_size = doc.pagePointSize(0)
+    img = QImage(page_size.toSize(), QImage.Format_ARGB32)
+    img.fill(Qt.white)
+    painter = QPainter(img)
+    doc.render(painter, 0, QRectF(QPointF(0, 0), QSizeF(page_size)))
+    painter.end()
+    if max_size.width() > 0 and max_size.height() > 0:
+        img = img.scaled(max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return QPixmap.fromImage(img)
 
 
 # -------------------------
@@ -139,6 +208,15 @@ CREATE TABLE IF NOT EXISTS gl_entry_item (
   FOREIGN KEY (entry_uuid) REFERENCES gl_entry(entry_uuid) ON DELETE CASCADE,
   FOREIGN KEY (account_code) REFERENCES gl_account(account_code),
   CHECK (dc IN ('D','C'))
+);
+
+CREATE TABLE IF NOT EXISTS gl_entry_attachment (
+  entry_uuid  TEXT PRIMARY KEY NOT NULL,
+  file_name   TEXT,
+  mime_type   TEXT NOT NULL,
+  file_blob   BLOB NOT NULL,
+  FOREIGN KEY (entry_uuid) REFERENCES gl_entry(entry_uuid) ON DELETE CASCADE,
+  CHECK (mime_type IN ('image/jpeg','image/png','application/pdf'))
 );
 
 CREATE TABLE IF NOT EXISTS user_setting (
@@ -267,6 +345,29 @@ class Repo:
         ).fetchone()
         return row["setting_value"] if row else "GBP"
 
+    # --- Attachments
+    def get_attachment(self, entry_uuid: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT entry_uuid, file_name, mime_type, file_blob FROM gl_entry_attachment WHERE entry_uuid=?",
+            (entry_uuid,),
+        ).fetchone()
+
+    def upsert_attachment(self, entry_uuid: str, file_name: Optional[str], mime_type: str, blob: bytes):
+        self.conn.execute(
+            """INSERT INTO gl_entry_attachment(entry_uuid, file_name, mime_type, file_blob)
+               VALUES(?,?,?,?)
+               ON CONFLICT(entry_uuid) DO UPDATE SET
+                 file_name=excluded.file_name,
+                 mime_type=excluded.mime_type,
+                 file_blob=excluded.file_blob""",
+            (entry_uuid, file_name, mime_type, sqlite3.Binary(blob)),
+        )
+        self.conn.commit()
+
+    def delete_attachment(self, entry_uuid: str):
+        self.conn.execute("DELETE FROM gl_entry_attachment WHERE entry_uuid=?", (entry_uuid,))
+        self.conn.commit()
+
     # --- Account master queries
     def list_accounts(self, where_sql: str = "", params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
         sql = """SELECT account_code, account_name, account_type, is_pl, is_active, is_user_managed
@@ -282,8 +383,52 @@ class Repo:
     def list_asset_accounts(self) -> List[sqlite3.Row]:
         return self.list_accounts("is_active=1 AND account_type='ASSET'")
 
+    def list_payment_accounts(self) -> List[sqlite3.Row]:
+        """Payment accounts can be ASSET (cash/bank) or LIAB (credit card)."""
+        return self.list_accounts("is_active=1 AND account_type IN ('ASSET','LIAB')")
+
     def list_user_managed_bs_accounts(self) -> List[sqlite3.Row]:
-        return self.list_accounts("is_user_managed=1 AND account_type IN ('ASSET','LIAB')")
+        return list(
+            self.conn.execute(
+                """SELECT account_code, account_name, account_type, is_active
+                       FROM gl_account
+                      WHERE is_user_managed=1
+                        AND account_type IN ('ASSET','LIAB')
+                   ORDER BY account_type, account_name"""
+            ).fetchall()
+        )
+
+    def find_account_by_name(
+        self,
+        account_name: str,
+        account_type: Optional[str] = None,
+        account_types: Optional[List[str]] = None,
+        active_required: bool = True,
+    ) -> Optional[sqlite3.Row]:
+        """Return account row matched by name (case-insensitive)."""
+        if not account_name:
+            return None
+        sql = """SELECT account_code, account_name, account_type, is_active
+                   FROM gl_account
+                  WHERE account_name = ? COLLATE NOCASE"""
+        params: List[Any] = [account_name]
+        if account_type:
+            sql += " AND account_type = ?"
+            params.append(account_type)
+        elif account_types:
+            placeholders = ",".join("?" * len(account_types))
+            sql += f" AND account_type IN ({placeholders})"
+            params.extend(account_types)
+        row = self.conn.execute(sql, params).fetchone()
+        if not row:
+            return None
+        if active_required and int(row["is_active"]) != 1:
+            return None
+        return row
+
+    def find_payment_account_by_name(self, account_name: str) -> Optional[sqlite3.Row]:
+        """Find active ASSET or LIAB account by name."""
+        return self.find_account_by_name(account_name, account_types=["ASSET", "LIAB"])
 
     def next_user_managed_code(self, account_type: str) -> str:
         if account_type == "ASSET":
@@ -295,26 +440,50 @@ class Repo:
         else:
             raise ValueError("account_type must be ASSET or LIAB")
 
+        # Use prefix-based scan (no account_type filter) to avoid collisions
+        # when legacy data has incorrect type/code combinations.
         row = self.conn.execute(
             """SELECT printf('%010d', COALESCE(MAX(CAST(account_code AS INTEGER)), ?) + 1) AS next_code
-               FROM gl_account
-               WHERE account_type=? AND account_code GLOB ?""",
-            (base_floor, account_type, pattern),
+                   FROM gl_account
+                  WHERE account_code GLOB ?""",
+            (base_floor, pattern),
         ).fetchone()
         return row["next_code"]
 
-    def upsert_user_managed_account(self, account_code: str, account_name: str, account_type: str, is_active: int):
+    def create_user_managed_account(self, account_name: str, account_type: str, is_active: int = 1) -> str:
+        if account_type not in ("ASSET", "LIAB"):
+            raise ValueError("account_type must be ASSET or LIAB")
+        code = self.next_user_managed_code(account_type)
         self.conn.execute(
-            """INSERT OR IGNORE INTO gl_account(account_code, account_name, account_type, is_pl, is_active, is_user_managed)
-               VALUES(?, ?, ?, 0, ?, 1)""",
-            (account_code, account_name, account_type, is_active),
-        )
-        self.conn.execute(
-            """UPDATE gl_account SET account_name=?, is_active=?
-               WHERE account_code=? AND is_user_managed=1 AND account_type IN ('ASSET','LIAB')""",
-            (account_name, is_active, account_code),
+            """INSERT INTO gl_account(account_code, account_name, account_type, is_pl, is_active, is_user_managed)
+                   VALUES(?, ?, ?, 0, ?, 1)""",
+            (code, account_name, account_type, is_active),
         )
         self.conn.commit()
+        return code
+
+    def update_user_managed_account(self, account_code: str, account_name: str, is_active: int):
+        cur = self.conn.execute(
+            """UPDATE gl_account
+                      SET account_name=?, is_active=?
+                    WHERE account_code=?
+                      AND is_user_managed=1
+                      AND account_type IN ('ASSET','LIAB')""",
+            (account_name, is_active, account_code),
+        )
+        if cur.rowcount == 0:
+            raise ValueError("Account not found or not user managed")
+        self.conn.commit()
+
+    def get_user_managed_account(self, account_code: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT account_code, account_name, account_type, is_active
+                   FROM gl_account
+                  WHERE account_code=?
+                    AND is_user_managed=1
+                    AND account_type IN ('ASSET','LIAB')""",
+            (account_code,),
+        ).fetchone()
 
     # --- Entry queries
     def get_entry_header(self, entry_uuid: str) -> Optional[sqlite3.Row]:
@@ -458,6 +627,246 @@ class Repo:
           a.account_code
         """
         return list(self.conn.execute(sql).fetchall())
+
+
+# -------------------------
+# JSON Expense Import Core
+# -------------------------
+
+class JsonExpenseImportError(Exception):
+    pass
+
+
+@dataclass
+class JsonExpenseImportResult:
+    entry_uuid: str
+    accounting_date: str
+    currency_original: str
+    total_amount_domestic: float
+    line_count: int
+
+
+class JsonExpenseImportService:
+    """Reusable core for importing expense entries from JSON (LLM/API)."""
+
+    def __init__(self, repo: Repo):
+        self.repo = repo
+
+    # Public API
+    def import_file(self, path: str) -> JsonExpenseImportResult:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as e:
+            raise JsonExpenseImportError(f"Failed to read JSON file: {e}") from e
+        return self.import_payload(payload)
+
+    def import_payload(self, payload: Any) -> JsonExpenseImportResult:
+        data = self._normalize_top(payload)
+        norm_lines = [
+            self._normalize_line(idx, line, data["currency_original"])
+            for idx, line in enumerate(data["lines"], start=1)
+        ]
+        items, total_dom, total_org = self._build_items(data, norm_lines)
+        entry_uuid = new_uuid()
+        try:
+            self.repo.save_entry_full_replace(
+                entry_uuid=entry_uuid,
+                accounting_date=data["accounting_date"],
+                entry_type="EXPENSE",
+                entry_title=data["entry_title"],
+                entry_text=data["entry_text"],
+                items=items,
+                is_new=True,
+            )
+        except Exception as e:
+            raise JsonExpenseImportError(str(e)) from e
+
+        return JsonExpenseImportResult(
+            entry_uuid=entry_uuid,
+            accounting_date=data["accounting_date"],
+            currency_original=data["currency_original"],
+            total_amount_domestic=total_dom,
+            line_count=len(norm_lines),
+        )
+
+    # Normalization / validation helpers
+    def _normalize_top(self, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise JsonExpenseImportError("Top-level JSON must be an object.")
+
+        allowed_keys = {"date", "store", "note", "payment_account", "currency_original", "lines"}
+        extra_keys = set(payload.keys()) - allowed_keys
+        if extra_keys:
+            raise JsonExpenseImportError(f"Unexpected fields: {', '.join(sorted(extra_keys))}")
+
+        if "payment_account" not in payload:
+            raise JsonExpenseImportError("payment_account is required.")
+        if "lines" not in payload:
+            raise JsonExpenseImportError("lines is required.")
+
+        date_raw = payload.get("date")
+        if date_raw in (None, ""):
+            accounting_date = dt.date.today().isoformat()
+        elif isinstance(date_raw, str) and self._is_valid_iso_date(date_raw):
+            accounting_date = date_raw
+        else:
+            raise JsonExpenseImportError("date must be YYYY-MM-DD or null.")
+
+        store = payload.get("store")
+        if store is not None:
+            if not isinstance(store, str):
+                raise JsonExpenseImportError("store must be a string or null.")
+            if len(store) > 200:
+                raise JsonExpenseImportError("store must be 200 characters or less.")
+            store = store.strip() or None
+
+        note = payload.get("note")
+        if note is not None:
+            if not isinstance(note, str):
+                raise JsonExpenseImportError("note must be a string or null.")
+            if len(note) > 500:
+                raise JsonExpenseImportError("note must be 500 characters or less.")
+            note = note.strip() or None
+
+        pay_name = payload.get("payment_account")
+        if not isinstance(pay_name, str) or not pay_name.strip():
+            raise JsonExpenseImportError("payment_account must be a non-empty string.")
+        pay_row = self.repo.find_payment_account_by_name(pay_name.strip())
+        if not pay_row:
+            raise JsonExpenseImportError(f"payment_account not found/active ASSET or LIAB account: {pay_name}")
+
+        currency = payload.get("currency_original")
+        if currency in (None, ""):
+            currency = self.repo.get_domestic_currency()
+        elif isinstance(currency, str):
+            currency = currency.strip().upper()
+            if not self._is_valid_currency(currency):
+                raise JsonExpenseImportError("currency_original must be a 3-letter code or null.")
+        else:
+            raise JsonExpenseImportError("currency_original must be a string or null.")
+
+        lines = payload.get("lines")
+        if not isinstance(lines, list):
+            raise JsonExpenseImportError("lines must be an array.")
+        if not (1 <= len(lines) <= 500):
+            raise JsonExpenseImportError("lines must contain between 1 and 500 items.")
+
+        return {
+            "accounting_date": accounting_date,
+            "entry_title": store,
+            "entry_text": note,
+            "payment_account_code": pay_row["account_code"],
+            "payment_account_name": pay_row["account_name"],
+            "currency_original": currency,
+            "lines": lines,
+        }
+
+    def _normalize_line(self, idx: int, line: Any, currency: str) -> Dict[str, Any]:
+        if not isinstance(line, dict):
+            raise JsonExpenseImportError(f"lines[{idx}] must be an object.")
+        allowed_keys = {"expense_category", "note", "amount_domestic", "amount_original"}
+        extra_keys = set(line.keys()) - allowed_keys
+        if extra_keys:
+            raise JsonExpenseImportError(f"lines[{idx}] unexpected fields: {', '.join(sorted(extra_keys))}")
+
+        cat_name = line.get("expense_category")
+        if not isinstance(cat_name, str) or not cat_name.strip():
+            raise JsonExpenseImportError(f"lines[{idx}].expense_category must be a non-empty string.")
+        cat_row = self.repo.find_account_by_name(cat_name.strip(), account_type="EXPENSE")
+        if not cat_row:
+            raise JsonExpenseImportError(f"lines[{idx}].expense_category not found/active EXPENSE account: {cat_name}")
+
+        ln_note = line.get("note")
+        if ln_note is not None:
+            if not isinstance(ln_note, str):
+                raise JsonExpenseImportError(f"lines[{idx}].note must be a string or null.")
+            if len(ln_note) > 500:
+                raise JsonExpenseImportError(f"lines[{idx}].note must be 500 characters or less.")
+            ln_note = ln_note.strip() or None
+
+        amt_dom = self._parse_positive_number(line.get("amount_domestic"), f"lines[{idx}].amount_domestic")
+        amt_org_raw = line.get("amount_original")
+        amt_org = self._parse_positive_number(
+            amt_org_raw if amt_org_raw is not None else amt_dom,
+            f"lines[{idx}].amount_original"
+        )
+
+        return {
+            "account_code": cat_row["account_code"],
+            "account_name": cat_row["account_name"],
+            "amount_domestic": amt_dom,
+            "amount_original": amt_org,
+            "item_text": ln_note,
+            "dc": "D",
+            "currency_original": currency,
+        }
+
+    def _build_items(
+        self,
+        data: Dict[str, Any],
+        lines: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], float, float]:
+        items: List[Dict[str, Any]] = []
+        total_dom = 0.0
+        total_org = 0.0
+
+        for ln in lines:
+            items.append(
+                {
+                    "account_code": ln["account_code"],
+                    "dc": "D",
+                    "amount_domestic": ln["amount_domestic"],
+                    "currency_original": data["currency_original"],
+                    "amount_original": ln["amount_original"],
+                    "item_text": ln["item_text"],
+                }
+            )
+            total_dom += float(ln["amount_domestic"])
+            total_org += float(ln["amount_original"])
+
+        if total_dom <= 0:
+            raise JsonExpenseImportError("Total amount_domestic must be greater than zero.")
+
+        items.append(
+            {
+                "account_code": data["payment_account_code"],
+                "dc": "C",
+                "amount_domestic": total_dom,
+                "currency_original": data["currency_original"],
+                "amount_original": total_org,
+                "item_text": None,
+            }
+        )
+
+        # Final guard against imbalance (should not happen)
+        diff = sum(it["amount_domestic"] if it["dc"] == "D" else -it["amount_domestic"] for it in items)
+        if abs(diff) > 1e-6:
+            raise JsonExpenseImportError(f"Debit/Credit not balanced after build. diff={diff:.6f}")
+
+        return items, total_dom, total_org
+
+    @staticmethod
+    def _parse_positive_number(value: Any, field_name: str) -> float:
+        try:
+            num = float(value)
+        except Exception:
+            raise JsonExpenseImportError(f"{field_name} must be a positive number.") from None
+        if not math.isfinite(num) or num <= 0:
+            raise JsonExpenseImportError(f"{field_name} must be a positive number.")
+        return num
+
+    @staticmethod
+    def _is_valid_iso_date(value: str) -> bool:
+        try:
+            dt.date.fromisoformat(value)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_valid_currency(value: str) -> bool:
+        return len(value) == 3 and value.isalpha() and value.isupper()
 
 
 # -------------------------
@@ -628,7 +1037,7 @@ class ExpenseJournalDetailDialog(QDialog):
         self.is_new = entry_uuid is None
 
         self.setWindowTitle("Expense Journal Detail" if self.is_new else "Expense Journal Detail (View/Edit)")
-        self.resize(780, 520)
+        self.resize(400, 620)  # compact, dialog-like width slightly smaller than main window
 
         root = QVBoxLayout(self)
 
@@ -641,6 +1050,21 @@ class ExpenseJournalDetailDialog(QDialog):
         self.store = QLineEdit()
         self.note = QTextEdit()
         self.note.setFixedHeight(70)
+        self.note_add_btn = QPushButton("Add note")
+        self.note_add_btn.clicked.connect(self._show_note_field)
+        self.note_shown_with_empty = False
+        self.note.textChanged.connect(self._update_note_visibility)
+        note_wrap = QVBoxLayout()
+        note_wrap.setContentsMargins(0, 0, 0, 0)
+        note_wrap.addWidget(self.note)
+        note_wrap.addWidget(self.note_add_btn, alignment=Qt.AlignLeft)
+        note_wrap_widget = QWidget()
+        note_wrap_widget.setLayout(note_wrap)
+        self.attach_data: Optional[bytes] = None
+        self.attach_mime: Optional[str] = None
+        self.attach_name: Optional[str] = None
+        self.attach_deleted: bool = False
+        self.attach_existing_present: bool = False
 
         self.currency = QLineEdit()
         self.currency.setPlaceholderText(self.dom)
@@ -653,13 +1077,15 @@ class ExpenseJournalDetailDialog(QDialog):
 
         form.addRow("Date", self.date)
         form.addRow("Store", self.store)
-        form.addRow("Note", self.note)
         form.addRow("Currency", self.currency)
         form.addRow("Payment account", self.payment)
+        self._build_attachment_ui(form)
+        form.addRow("Note", note_wrap_widget)
         root.addLayout(form)
 
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Category", "Amount (domestic)", "Original amount", ""])
+        dom_label = f"Amount ({self.dom})"
+        self.table.setHorizontalHeaderLabels(["Category", dom_label, "", ""])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -691,6 +1117,9 @@ class ExpenseJournalDetailDialog(QDialog):
 
         self.cat_map: Dict[str, str] = {}
         self._load_categories()
+        self._refresh_original_amount_header(self.currency.text())
+        self._update_attachment_preview()
+        self._update_note_visibility()
 
         if self.is_new:
             self.btn_edit.setVisible(False)
@@ -706,8 +1135,134 @@ class ExpenseJournalDetailDialog(QDialog):
         for r in self.repo.list_expense_categories():
             self.cat_map[r["account_name"]] = r["account_code"]
 
+    def _build_attachment_ui(self, form: QFormLayout):
+        self.attach_preview = QLabel("No attachment")
+        self.attach_preview.setAlignment(Qt.AlignLeft)
+        self.attach_preview.setMinimumSize(240, 160)
+        self.attach_preview.setMaximumSize(320, 220)
+        self.attach_preview.setStyleSheet("border: 1px solid #ccc; background: #fafafa;")
+
+        self.attach_name_lbl = QLabel("None")
+        self.attach_name_lbl.setStyleSheet("color: #666;")
+
+        self.attach_add_btn = QPushButton("Add / Replace")
+        self.attach_remove_btn = QPushButton("Remove")
+        self.attach_add_btn.clicked.connect(self.on_select_attachment)
+        self.attach_remove_btn.clicked.connect(self.on_remove_attachment)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self.attach_add_btn)
+        btns.addWidget(self.attach_remove_btn)
+        btns.addStretch(1)
+
+        container = QVBoxLayout()
+        container.setContentsMargins(0, 0, 0, 0)
+        container.addWidget(self.attach_preview)
+        container.addWidget(self.attach_name_lbl)
+        container.addLayout(btns)
+
+        wrap = QWidget()
+        wrap.setLayout(container)
+        wrap.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Attachment", wrap)
+
+    def _show_note_field(self):
+        if self.view_mode:
+            return
+        self.note_shown_with_empty = True
+        self._update_note_visibility()
+        self.note.setFocus()
+
+    def _update_note_visibility(self):
+        has_text = bool(self.note.toPlainText().strip())
+        if has_text:
+            self.note_shown_with_empty = False
+        show_note = has_text or self.note_shown_with_empty
+        self.note.setVisible(show_note)
+        self.note_add_btn.setVisible(not show_note)
+
+    def _refresh_original_amount_header(self, ccy: str):
+        ccy = (ccy or "").strip().upper()
+        label = f"Amount ({ccy})" if ccy else "Amount"
+        item = self.table.horizontalHeaderItem(2)
+        if item:
+            item.setText(label)
+        else:
+            self.table.setHorizontalHeaderItem(2, QTableWidgetItem(label))
+
+    def _update_attachment_preview(self):
+        max_size = QSize(300, 200)
+        pixmap: Optional[QPixmap] = None
+        if self.attach_data and self.attach_mime:
+            if self.attach_mime in ("image/jpeg", "image/png"):
+                pixmap = pixmap_from_image_bytes(self.attach_data, max_size)
+            elif self.attach_mime == "application/pdf":
+                pixmap = pixmap_from_pdf_bytes(self.attach_data, max_size)
+        if pixmap:
+            self.attach_preview.setPixmap(pixmap)
+            self.attach_preview.setScaledContents(False)
+        else:
+            self.attach_preview.setPixmap(QPixmap())
+            self.attach_preview.setText("No attachment" if not self.attach_deleted else "Will remove on save")
+
+        name_text = self.attach_name if self.attach_name else "None"
+        if self.attach_deleted:
+            name_text += " (removed)"
+        self.attach_name_lbl.setText(name_text)
+        self.attach_remove_btn.setEnabled(
+            not self.view_mode and (self.attach_data is not None or self.attach_existing_present or self.attach_deleted)
+        )
+
+    def on_select_attachment(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select attachment",
+            "",
+            "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
+        )
+        if not path:
+            return
+        mime = guess_mime_from_path(path)
+        if mime not in ALLOWED_MIME:
+            QMessageBox.warning(self, "Invalid file", "Only JPG, PNG, or PDF files are allowed.")
+            return
+        size = os.path.getsize(path)
+        if size > ATTACH_MAX_BYTES:
+            QMessageBox.warning(self, "File too large", "File must be 10MB or smaller.")
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
+            return
+
+        self.attach_data = data
+        self.attach_mime = mime
+        self.attach_name = os.path.basename(path)
+        self.attach_deleted = False
+        # existing attachment will be replaced on save
+        self._update_attachment_preview()
+
+    def on_remove_attachment(self):
+        self.attach_data = None
+        self.attach_mime = None
+        self.attach_name = None
+        self.attach_deleted = True
+        self.attach_existing_present = False
+        self._update_attachment_preview()
+
+    def _refresh_original_amount_header(self, ccy: str):
+        ccy = (ccy or "").strip().upper()
+        label = f"Amount ({ccy})" if ccy else "Amount"
+        item = self.table.horizontalHeaderItem(2)
+        if item:
+            item.setText(label)
+        else:
+            self.table.setHorizontalHeaderItem(2, QTableWidgetItem(label))
+
     def _load_payment_accounts(self):
-        rows = self.repo.list_asset_accounts()
+        rows = self.repo.list_payment_accounts()
         self.payment.clear()
         self.payment_map.clear()
         for r in rows:
@@ -718,22 +1273,28 @@ class ExpenseJournalDetailDialog(QDialog):
 
     def on_currency_changed(self, ccy: str):
         ccy = ccy.strip().upper() if ccy else ""
+        self._refresh_original_amount_header(ccy or self.dom)
         is_foreign = (ccy != "" and ccy != self.dom)
         self.table.setColumnHidden(2, not is_foreign)
 
     def set_view_mode(self):
         self.view_mode = True
-        for w in [self.date, self.store, self.note, self.currency, self.payment]:
+        for w in [self.date, self.store, self.note, self.currency, self.payment, self.note_add_btn]:
             w.setEnabled(False)
         self.table.setEnabled(False)
         self.btn_save.setEnabled(False)
         self.btn_add_line.setEnabled(False)
         self.btn_delete.setEnabled(True)
         self.btn_edit.setEnabled(True)
+        self.attach_add_btn.setEnabled(False)
+        self.attach_remove_btn.setEnabled(False)
+        self._update_attachment_preview()
+        self.note_shown_with_empty = False
+        self._update_note_visibility()
 
     def set_edit_mode(self):
         self.view_mode = False
-        for w in [self.date, self.store, self.note, self.currency, self.payment]:
+        for w in [self.date, self.store, self.note, self.currency, self.payment, self.note_add_btn]:
             w.setEnabled(True)
         self.table.setEnabled(True)
         self.btn_save.setEnabled(True)
@@ -741,6 +1302,79 @@ class ExpenseJournalDetailDialog(QDialog):
         self.btn_delete.setEnabled(True)
         self.btn_edit.setEnabled(False)
         self.btn_cancel.setText("Cancel")
+        self.attach_add_btn.setEnabled(True)
+        self.attach_remove_btn.setEnabled(True)
+        self._update_attachment_preview()
+        self._update_note_visibility()
+
+    def _update_attachment_preview(self):
+        max_size = QSize(300, 200)
+        has_attachment = (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
+        pixmap: Optional[QPixmap] = None
+        if has_attachment and self.attach_data and self.attach_mime:
+            if self.attach_mime in ("image/jpeg", "image/png"):
+                pixmap = pixmap_from_image_bytes(self.attach_data, max_size)
+            elif self.attach_mime == "application/pdf":
+                pixmap = pixmap_from_pdf_bytes(self.attach_data, max_size)
+
+        self.attach_preview.setVisible(has_attachment)
+        if has_attachment:
+            if pixmap:
+                self.attach_preview.setPixmap(pixmap)
+                self.attach_preview.setScaledContents(False)
+                self.attach_preview.setText("")
+            else:
+                self.attach_preview.setPixmap(QPixmap())
+                self.attach_preview.setText("Preview not available")
+        else:
+            self.attach_preview.setPixmap(QPixmap())
+            self.attach_preview.setText("")
+
+        name_text = self.attach_name if self.attach_name else "None"
+        if self.attach_deleted:
+            name_text += " (removed)"
+        self.attach_name_lbl.setText(name_text)
+        self.attach_remove_btn.setEnabled(
+            not self.view_mode and (self.attach_data is not None or self.attach_existing_present or self.attach_deleted)
+        )
+
+    def on_select_attachment(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select attachment",
+            "",
+            "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
+        )
+        if not path:
+            return
+        mime = guess_mime_from_path(path)
+        if mime not in ALLOWED_MIME:
+            QMessageBox.warning(self, "Invalid file", "Only JPG, PNG, or PDF files are allowed.")
+            return
+        size = os.path.getsize(path)
+        if size > ATTACH_MAX_BYTES:
+            QMessageBox.warning(self, "File too large", "File must be 10MB or smaller.")
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
+            return
+
+        self.attach_data = data
+        self.attach_mime = mime
+        self.attach_name = os.path.basename(path)
+        self.attach_deleted = False
+        self._update_attachment_preview()
+
+    def on_remove_attachment(self):
+        self.attach_data = None
+        self.attach_mime = None
+        self.attach_name = None
+        self.attach_deleted = True
+        self.attach_existing_present = False
+        self._update_attachment_preview()
 
     def add_line(self):
         row = self.table.rowCount()
@@ -785,10 +1419,26 @@ class ExpenseJournalDetailDialog(QDialog):
         self.date.setDate(iso_to_qdate(h["accounting_date"]))
         self.store.setText(h["entry_title"] or "")
         self.note.setPlainText(h["entry_text"] or "")
+        self._update_note_visibility()
 
         items = self.repo.get_entry_items(self.entry_uuid)
         if items:
             self.currency.setText(items[0]["currency_original"])
+
+        att = self.repo.get_attachment(self.entry_uuid)
+        if att:
+            self.attach_data = att["file_blob"]
+            self.attach_mime = att["mime_type"]
+            self.attach_name = att["file_name"]
+            self.attach_deleted = False
+            self.attach_existing_present = True
+        else:
+            self.attach_data = None
+            self.attach_mime = None
+            self.attach_name = None
+            self.attach_deleted = False
+            self.attach_existing_present = False
+        self._update_attachment_preview()
 
         pay_code = None
         for it in items:
@@ -873,6 +1523,17 @@ class ExpenseJournalDetailDialog(QDialog):
         })
         return items
 
+    def _save_attachment(self):
+        if not self.entry_uuid:
+            return
+        if self.attach_data and self.attach_mime:
+            self.repo.upsert_attachment(self.entry_uuid, self.attach_name, self.attach_mime, self.attach_data)
+            self.attach_existing_present = True
+            self.attach_deleted = False
+        elif self.attach_deleted or self.attach_existing_present:
+            self.repo.delete_attachment(self.entry_uuid)
+            self.attach_existing_present = False
+
     def on_save(self):
         try:
             accounting_date = qdate_to_iso(self.date.date())
@@ -894,6 +1555,7 @@ class ExpenseJournalDetailDialog(QDialog):
                 is_new=self.is_new,
             )
             self.is_new = False
+            self._save_attachment()
             QMessageBox.information(self, "Saved", "Entry saved.")
             self.accept()
         except Exception as e:
@@ -913,12 +1575,13 @@ class ExpenseJournalDetailDialog(QDialog):
 
 
 class GeneralJournalDetailDialog(QDialog):
-    def __init__(self, repo: Repo, entry_uuid: Optional[str] = None, parent=None):
+    def __init__(self, repo: Repo, entry_uuid: Optional[str] = None, parent=None, start_edit_mode: bool = False):
         super().__init__(parent)
         self.repo = repo
         self.dom = self.repo.get_domestic_currency()
         self.entry_uuid = entry_uuid
         self.is_new = entry_uuid is None
+        self.start_edit_mode = start_edit_mode
 
         self.setWindowTitle("General Journal Detail" if self.is_new else "General Journal Detail (View/Edit)")
         self.resize(860, 560)
@@ -935,14 +1598,31 @@ class GeneralJournalDetailDialog(QDialog):
         self.title = QLineEdit()
         self.note = QTextEdit()
         self.note.setFixedHeight(70)
+        self.note_add_btn = QPushButton("Add note")
+        self.note_add_btn.clicked.connect(self._show_note_field)
+        self.note_shown_with_empty = False
+        self.note.textChanged.connect(self._update_note_visibility)
+        note_wrap = QVBoxLayout()
+        note_wrap.setContentsMargins(0, 0, 0, 0)
+        note_wrap.addWidget(self.note)
+        note_wrap.addWidget(self.note_add_btn, alignment=Qt.AlignLeft)
+        note_wrap_widget = QWidget()
+        note_wrap_widget.setLayout(note_wrap)
+        self.attach_data: Optional[bytes] = None
+        self.attach_mime: Optional[str] = None
+        self.attach_name: Optional[str] = None
+        self.attach_deleted: bool = False
+        self.attach_existing_present: bool = False
         form.addRow("Type", self.entry_type)
         form.addRow("Date", self.date)
-        form.addRow("Title", self.title)
-        form.addRow("Note", self.note)
+        form.addRow("Title (Vendor)", self.title)
+        self._build_attachment_ui(form)
+        form.addRow("Note", note_wrap_widget)
         root.addLayout(form)
 
         self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["Account", "D/C", "Amount (domestic)", "Currency", "Original amount", "Item note", ""])
+        dom_label = f"Amount ({self.dom})"
+        self.table.setHorizontalHeaderLabels(["Account", "D/C", dom_label, "Currency", "Original amount", "Item note", ""])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for c in [1, 2, 3, 4, 6]:
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
@@ -974,6 +1654,8 @@ class GeneralJournalDetailDialog(QDialog):
 
         self.accounts = self.repo.list_accounts("is_active=1")
         self.account_map = {r["account_name"]: r["account_code"] for r in self.accounts}
+        self._update_attachment_preview()
+        self._update_note_visibility()
 
         if self.is_new:
             self.btn_edit.setVisible(False)
@@ -983,21 +1665,75 @@ class GeneralJournalDetailDialog(QDialog):
             self.add_line()
         else:
             self.load_entry()
-            self.set_view_mode()
+            if self.start_edit_mode:
+                self.set_edit_mode()
+            else:
+                self.set_view_mode()
+
+    def _build_attachment_ui(self, form: QFormLayout):
+        self.attach_preview = QLabel("No attachment")
+        self.attach_preview.setAlignment(Qt.AlignLeft)
+        self.attach_preview.setMinimumSize(240, 160)
+        self.attach_preview.setMaximumSize(320, 220)
+        self.attach_preview.setStyleSheet("border: 1px solid #ccc; background: #fafafa;")
+
+        self.attach_name_lbl = QLabel("None")
+        self.attach_name_lbl.setStyleSheet("color: #666;")
+
+        self.attach_add_btn = QPushButton("Add / Replace")
+        self.attach_remove_btn = QPushButton("Remove")
+        self.attach_add_btn.clicked.connect(self.on_select_attachment)
+        self.attach_remove_btn.clicked.connect(self.on_remove_attachment)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self.attach_add_btn)
+        btns.addWidget(self.attach_remove_btn)
+        btns.addStretch(1)
+
+        container = QVBoxLayout()
+        container.setContentsMargins(0, 0, 0, 0)
+        container.addWidget(self.attach_preview)
+        container.addWidget(self.attach_name_lbl)
+        container.addLayout(btns)
+
+        wrap = QWidget()
+        wrap.setLayout(container)
+        wrap.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Attachment", wrap)
+
+    def _show_note_field(self):
+        if self.view_mode:
+            return
+        self.note_shown_with_empty = True
+        self._update_note_visibility()
+        self.note.setFocus()
+
+    def _update_note_visibility(self):
+        has_text = bool(self.note.toPlainText().strip())
+        if has_text:
+            self.note_shown_with_empty = False
+        show_note = has_text or self.note_shown_with_empty
+        self.note.setVisible(show_note)
+        self.note_add_btn.setVisible(not show_note)
 
     def set_view_mode(self):
         self.view_mode = True
-        for w in [self.entry_type, self.date, self.title, self.note]:
+        for w in [self.entry_type, self.date, self.title, self.note, self.note_add_btn]:
             w.setEnabled(False)
         self.table.setEnabled(False)
         self.btn_save.setEnabled(False)
         self.btn_add_line.setEnabled(False)
         self.btn_delete.setEnabled(True)
         self.btn_edit.setEnabled(True)
+        self.attach_add_btn.setEnabled(False)
+        self.attach_remove_btn.setEnabled(False)
+        self._update_attachment_preview()
+        self.note_shown_with_empty = False
+        self._update_note_visibility()
 
     def set_edit_mode(self):
         self.view_mode = False
-        for w in [self.entry_type, self.date, self.title, self.note]:
+        for w in [self.entry_type, self.date, self.title, self.note, self.note_add_btn]:
             w.setEnabled(True)
         self.table.setEnabled(True)
         self.btn_save.setEnabled(True)
@@ -1005,6 +1741,79 @@ class GeneralJournalDetailDialog(QDialog):
         self.btn_delete.setEnabled(True)
         self.btn_edit.setEnabled(False)
         self.btn_cancel.setText("Cancel")
+        self.attach_add_btn.setEnabled(True)
+        self.attach_remove_btn.setEnabled(True)
+        self._update_attachment_preview()
+        self._update_note_visibility()
+
+    def _update_attachment_preview(self):
+        max_size = QSize(300, 200)
+        has_attachment = (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
+        pixmap: Optional[QPixmap] = None
+        if has_attachment and self.attach_data and self.attach_mime:
+            if self.attach_mime in ("image/jpeg", "image/png"):
+                pixmap = pixmap_from_image_bytes(self.attach_data, max_size)
+            elif self.attach_mime == "application/pdf":
+                pixmap = pixmap_from_pdf_bytes(self.attach_data, max_size)
+
+        self.attach_preview.setVisible(has_attachment)
+        if has_attachment:
+            if pixmap:
+                self.attach_preview.setPixmap(pixmap)
+                self.attach_preview.setScaledContents(False)
+                self.attach_preview.setText("")
+            else:
+                self.attach_preview.setPixmap(QPixmap())
+                self.attach_preview.setText("Preview not available")
+        else:
+            self.attach_preview.setPixmap(QPixmap())
+            self.attach_preview.setText("")
+
+        name_text = self.attach_name if self.attach_name else "None"
+        if self.attach_deleted:
+            name_text += " (removed)"
+        self.attach_name_lbl.setText(name_text)
+        self.attach_remove_btn.setEnabled(
+            not self.view_mode and (self.attach_data is not None or self.attach_existing_present or self.attach_deleted)
+        )
+
+    def on_select_attachment(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select attachment",
+            "",
+            "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
+        )
+        if not path:
+            return
+        mime = guess_mime_from_path(path)
+        if mime not in ALLOWED_MIME:
+            QMessageBox.warning(self, "Invalid file", "Only JPG, PNG, or PDF files are allowed.")
+            return
+        size = os.path.getsize(path)
+        if size > ATTACH_MAX_BYTES:
+            QMessageBox.warning(self, "File too large", "File must be 10MB or smaller.")
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
+            return
+
+        self.attach_data = data
+        self.attach_mime = mime
+        self.attach_name = os.path.basename(path)
+        self.attach_deleted = False
+        self._update_attachment_preview()
+
+    def on_remove_attachment(self):
+        self.attach_data = None
+        self.attach_mime = None
+        self.attach_name = None
+        self.attach_deleted = True
+        self.attach_existing_present = False
+        self._update_attachment_preview()
 
     def add_line(self):
         row = self.table.rowCount()
@@ -1061,6 +1870,22 @@ class GeneralJournalDetailDialog(QDialog):
         self.date.setDate(iso_to_qdate(h["accounting_date"]))
         self.title.setText(h["entry_title"] or "")
         self.note.setPlainText(h["entry_text"] or "")
+        self._update_note_visibility()
+
+        att = self.repo.get_attachment(self.entry_uuid)
+        if att:
+            self.attach_data = att["file_blob"]
+            self.attach_mime = att["mime_type"]
+            self.attach_name = att["file_name"]
+            self.attach_deleted = False
+            self.attach_existing_present = True
+        else:
+            self.attach_data = None
+            self.attach_mime = None
+            self.attach_name = None
+            self.attach_deleted = False
+            self.attach_existing_present = False
+        self._update_attachment_preview()
 
         items = self.repo.get_entry_items(self.entry_uuid)
         self.table.setRowCount(0)
@@ -1128,6 +1953,17 @@ class GeneralJournalDetailDialog(QDialog):
             raise ValueError("Add at least one line with amount > 0")
         return items
 
+    def _save_attachment(self):
+        if not self.entry_uuid:
+            return
+        if self.attach_data and self.attach_mime:
+            self.repo.upsert_attachment(self.entry_uuid, self.attach_name, self.attach_mime, self.attach_data)
+            self.attach_existing_present = True
+            self.attach_deleted = False
+        elif self.attach_deleted or self.attach_existing_present:
+            self.repo.delete_attachment(self.entry_uuid)
+            self.attach_existing_present = False
+
     def on_save(self):
         try:
             accounting_date = qdate_to_iso(self.date.date())
@@ -1150,6 +1986,7 @@ class GeneralJournalDetailDialog(QDialog):
                 is_new=self.is_new,
             )
             self.is_new = False
+            self._save_attachment()
             QMessageBox.information(self, "Saved", "Entry saved.")
             self.accept()
         except Exception as e:
@@ -1168,7 +2005,103 @@ class GeneralJournalDetailDialog(QDialog):
             QMessageBox.critical(self, "Delete failed", str(e))
 
 
+class BalanceSheetAccountEditDialog(QDialog):
+    """Add/Edit dialog for user-managed BS accounts (ASSET/LIAB)."""
+
+    def __init__(self, repo: Repo, account_code: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self.account_code = account_code
+        self.is_new = account_code is None
+
+        self.setWindowTitle("Add Balance Sheet Account" if self.is_new else "Balance Sheet Account Detail")
+        self.resize(420, 220)
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.typ = QComboBox()
+        self.typ.addItems(["ASSET", "LIAB"])
+        self.name = QLineEdit()
+        self.active = QCheckBox("Active")
+        self.active.setChecked(True)
+
+        form.addRow("Type", self.typ)
+        form.addRow("Name", self.name)
+        form.addRow("", self.active)
+        root.addLayout(form)
+
+        btns = QHBoxLayout()
+        self.btn_edit = QPushButton("Edit")
+        self.btn_save = QPushButton("Save")
+        self.btn_cancel = QPushButton("Close" if not self.is_new else "Cancel")
+        self.btn_save.setDefault(True)
+
+        if not self.is_new:
+            btns.addWidget(self.btn_edit)
+        btns.addStretch(1)
+        btns.addWidget(self.btn_cancel)
+        btns.addWidget(self.btn_save)
+        root.addLayout(btns)
+
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_save.clicked.connect(self.on_save)
+        if not self.is_new:
+            self.btn_edit.clicked.connect(self.enable_edit_mode)
+        else:
+            self.btn_edit.setVisible(False)
+
+        if self.is_new:
+            self.set_edit_mode(True)
+        else:
+            self.load_account()
+            self.set_edit_mode(False)
+
+    def set_edit_mode(self, editable: bool):
+        self.view_mode = not editable
+        self.name.setEnabled(editable)
+        self.active.setEnabled(editable)
+        # account_type is fixed after creation (ties to code prefix)
+        self.typ.setEnabled(self.is_new and editable)
+        self.btn_save.setEnabled(editable)
+        if not self.is_new:
+            self.btn_edit.setEnabled(not editable)
+            self.btn_cancel.setText("Close" if not editable else "Cancel")
+
+    def enable_edit_mode(self):
+        self.set_edit_mode(True)
+
+    def load_account(self):
+        row = self.repo.get_user_managed_account(self.account_code)
+        if not row:
+            QMessageBox.critical(self, "Error", "Account not found or not user managed.")
+            self.reject()
+            return
+        self.typ.setCurrentText(row["account_type"])
+        self.name.setText(row["account_name"])
+        self.active.setChecked(int(row["is_active"]) == 1)
+
+    def on_save(self):
+        nm = self.name.text().strip()
+        if not nm:
+            QMessageBox.warning(self, "Validation", "Account name is required.")
+            return
+        is_active = 1 if self.active.isChecked() else 0
+        try:
+            if self.is_new:
+                t = self.typ.currentText()
+                self.account_code = self.repo.create_user_managed_account(nm, t, is_active)
+            else:
+                self.repo.update_user_managed_account(self.account_code, nm, is_active)
+            QMessageBox.information(self, "Saved", "Account saved.")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+
+
 class BalanceSheetAccountDetailDialog(QDialog):
+    """List + entry point for Balance Sheet Account Detail management."""
+
     def __init__(self, repo: Repo, parent=None):
         super().__init__(parent)
         self.repo = repo
@@ -1178,6 +2111,7 @@ class BalanceSheetAccountDetailDialog(QDialog):
         root = QVBoxLayout(self)
         self.list = QListWidget()
         self.list.setSpacing(6)
+        self.list.itemDoubleClicked.connect(self.on_item_activated)
         root.addWidget(self.list)
 
         btn_row = QHBoxLayout()
@@ -1219,82 +2153,49 @@ class BalanceSheetAccountDetailDialog(QDialog):
             w = QWidget()
             lay = QHBoxLayout(w)
             lay.setContentsMargins(12, 8, 12, 8)
+            lay.setSpacing(12)
 
             icon = QLabel(bs_icon(r["account_code"], t))
             icon.setFixedWidth(28)
             icon.setAlignment(Qt.AlignCenter)
 
-            name = QLineEdit(r["account_name"])
-            active = QCheckBox("Active")
-            active.setChecked(int(r["is_active"]) == 1)
+            text_col = QVBoxLayout()
+            name_lbl = QLabel(r["account_name"])
+            type_lbl = QLabel(ACCOUNT_TYPE_LABEL.get(t, t))
+            type_lbl.setStyleSheet("color: #666; font-size: 12px;")
+            text_col.addWidget(name_lbl)
+            text_col.addWidget(type_lbl)
 
-            save = QPushButton("Save")
-            save.clicked.connect(lambda _, i=item, n=name, a=active: self.save_row(i, n, a))
+            active_lbl = QLabel("Active" if r["is_active"] else "Inactive")
+            if r["is_active"]:
+                active_lbl.setStyleSheet("color: #0a7a0a;")
+            else:
+                active_lbl.setStyleSheet("color: #a00;")
+
+            edit_btn = QPushButton("Edit")
+            edit_btn.clicked.connect(lambda _, code=r["account_code"]: self.edit_account(code))
 
             lay.addWidget(icon)
-            lay.addWidget(name, 1)
-            lay.addWidget(active)
-            lay.addWidget(save)
+            lay.addLayout(text_col, 1)
+            lay.addWidget(active_lbl)
+            lay.addWidget(edit_btn)
 
             self.list.setItemWidget(item, w)
-            item.setSizeHint(QSize(10, 52))
+            item.setSizeHint(QSize(10, 64))
 
-    def save_row(self, item: QListWidgetItem, name_edit: QLineEdit, active_chk: QCheckBox):
+    def on_item_activated(self, item: QListWidgetItem):
         data = item.data(Qt.UserRole) or {}
         if data.get("kind") != "row":
             return
-        account_code = data["account_code"]
-        account_type = data["account_type"]
-        name = name_edit.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Validation", "Account name is required.")
-            return
-        is_active = 1 if active_chk.isChecked() else 0
-        try:
-            self.repo.upsert_user_managed_account(account_code, name, account_type, is_active)
-            QMessageBox.information(self, "Saved", "Account saved.")
+        self.edit_account(data["account_code"])
+
+    def edit_account(self, account_code: str):
+        dlg = BalanceSheetAccountEditDialog(self.repo, account_code, parent=self)
+        if dlg.exec() == QDialog.Accepted:
             self.refresh()
-        except Exception as e:
-            QMessageBox.critical(self, "Save failed", str(e))
 
     def add_account(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Add Balance Sheet Account")
-        lay = QVBoxLayout(dlg)
-        form = QFormLayout()
-        typ = QComboBox()
-        typ.addItems(["ASSET", "LIAB"])
-        name = QLineEdit()
-        form.addRow("Type", typ)
-        form.addRow("Name", name)
-        lay.addLayout(form)
-
-        btns = QHBoxLayout()
-        b_cancel = QPushButton("Cancel")
-        b_save = QPushButton("Save")
-        b_save.setDefault(True)
-        btns.addStretch(1)
-        btns.addWidget(b_cancel)
-        btns.addWidget(b_save)
-        lay.addLayout(btns)
-
-        b_cancel.clicked.connect(dlg.reject)
-
-        def _save():
-            t = typ.currentText()
-            n = name.text().strip()
-            if not n:
-                QMessageBox.warning(dlg, "Validation", "Name is required.")
-                return
-            code = self.repo.next_user_managed_code(t)
-            try:
-                self.repo.upsert_user_managed_account(code, n, t, 1)
-                dlg.accept()
-            except Exception as e:
-                QMessageBox.critical(dlg, "Save failed", str(e))
-
-        b_save.clicked.connect(_save)
-
+        dlg = BalanceSheetAccountEditDialog(self.repo, account_code=None, parent=self)
         if dlg.exec() == QDialog.Accepted:
             self.refresh()
 
@@ -1409,6 +2310,7 @@ class MainWindow(QMainWindow):
     def __init__(self, repo: Repo):
         super().__init__()
         self.repo = repo
+        self.importer = JsonExpenseImportService(repo)
         self.setWindowTitle("Debibi")
         self.resize(430, 760)
 
@@ -1418,11 +2320,13 @@ class MainWindow(QMainWindow):
 
         act_new_expense = QAction("New Expense Entry", self)
         act_new_general = QAction("New Journal Entry", self)
+        act_import_json = QAction("Import JSON Entry", self)
         act_manage_accounts = QAction("Manage BS Accounts", self)
         act_refresh = QAction("Refresh", self)
 
         m.addAction(act_new_expense)
         m.addAction(act_new_general)
+        m.addAction(act_import_json)
         m.addSeparator()
         m.addAction(act_manage_accounts)
         m.addSeparator()
@@ -1430,6 +2334,7 @@ class MainWindow(QMainWindow):
 
         act_new_expense.triggered.connect(self.new_expense)
         act_new_general.triggered.connect(self.new_general)
+        act_import_json.triggered.connect(self.import_json_entry)
         act_manage_accounts.triggered.connect(self.manage_accounts)
         act_refresh.triggered.connect(self.refresh_all)
 
@@ -1490,6 +2395,30 @@ class MainWindow(QMainWindow):
         dlg = GeneralJournalDetailDialog(self.repo, entry_uuid=None, parent=self)
         if dlg.exec():
             self.refresh_all()
+
+    def import_json_entry(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import JSON entry",
+            "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            result = self.importer.import_file(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", str(e))
+            return
+
+        dlg = GeneralJournalDetailDialog(
+            self.repo,
+            entry_uuid=result.entry_uuid,
+            parent=self,
+            start_edit_mode=True,
+        )
+        dlg.exec()
+        self.refresh_all()
 
     def manage_accounts(self):
         dlg = BalanceSheetAccountDetailDialog(self.repo, parent=self)
