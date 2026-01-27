@@ -38,10 +38,19 @@ from google.genai import types as genai_types
 from pdf2image import convert_from_bytes
 from PIL import Image
 from PySide6.QtCore import QBuffer, QByteArray, QDate, QIODevice, QPointF, QRectF, QSize, QSizeF, Qt, Signal, QThread, QObject
-from PySide6.QtGui import QAction, QFont, QImage, QPainter, QPixmap, QColor
+from PySide6.QtGui import QAction, QFont, QImage, QPainter, QPixmap, QColor, QIcon, QPen
 from PySide6.QtMultimedia import QCamera, QImageCapture, QMediaCaptureSession, QMediaDevices
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtPdf import QPdfDocument
+from PySide6.QtCharts import (
+    QBarCategoryAxis,
+    QBarSet,
+    QChart,
+    QChartView,
+    QLineSeries,
+    QStackedBarSeries,
+    QValueAxis,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -108,6 +117,25 @@ EXPENSE_ICON_BY_CODE = {
     "5000000009": "🧾",
     "5000000010": "🧩",
 }
+
+COLOR_PALETTE = [
+    "#5b8ff9",
+    "#5ad8a6",
+    "#5d7092",
+    "#f6bd16",
+    "#6f5ef9",
+    "#6dc8ec",
+    "#945fb9",
+    "#ff9845",
+    "#1e9493",
+    "#ff99c3",
+]
+
+def color_for_key(key: str) -> QColor:
+    if not key:
+        return QColor("#5b8ff9")
+    idx = sum(ord(c) for c in key) % len(COLOR_PALETTE)
+    return QColor(COLOR_PALETTE[idx])
 
 def bs_icon(account_code: str, account_type: str) -> str:
     if account_code == "0000000001":
@@ -693,6 +721,116 @@ class Repo:
           a.account_code
         """
         return list(self.conn.execute(sql).fetchall())
+
+    def list_expense_trend(
+        self,
+        granularity: str = "day",
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> List[sqlite3.Row]:
+        label_expr = "e.accounting_date" if granularity == "day" else "substr(e.accounting_date,1,7)"
+        sql = f"""
+        SELECT
+          {label_expr} AS label,
+          ei.account_code,
+          a.account_name,
+          SUM(CASE WHEN ei.dc='D' THEN ei.amount_domestic ELSE -ei.amount_domestic END) AS amount_domestic_sum
+        FROM gl_entry_item ei
+        JOIN gl_entry e   ON e.entry_uuid = ei.entry_uuid
+        JOIN gl_account a ON a.account_code = ei.account_code
+        WHERE a.is_active=1
+          AND a.account_type='EXPENSE'
+        """
+        params: List[Any] = []
+        if date_from:
+            sql += " AND e.accounting_date >= ?"
+            params.append(date_from)
+        if date_to:
+            sql += " AND e.accounting_date <= ?"
+            params.append(date_to)
+        sql += " GROUP BY label, ei.account_code, a.account_name ORDER BY label ASC, ei.account_code ASC"
+        return list(self.conn.execute(sql, params).fetchall())
+
+    def _opening_balances(self, date_from: Optional[str]) -> Tuple[float, float]:
+        if not date_from:
+            return 0.0, 0.0
+        sql = """
+        SELECT
+          a.account_type,
+          SUM(CASE WHEN ei.dc='D' THEN ei.amount_domestic ELSE -ei.amount_domestic END) AS delta_amount
+        FROM gl_entry_item ei
+        JOIN gl_entry e   ON e.entry_uuid = ei.entry_uuid
+        JOIN gl_account a ON a.account_code = ei.account_code
+        WHERE a.is_active=1
+          AND a.account_type IN ('ASSET','LIAB')
+          AND e.accounting_date < ?
+        GROUP BY a.account_type
+        """
+        asset_open = 0.0
+        liab_open = 0.0
+        for r in self.conn.execute(sql, (date_from,)).fetchall():
+            if r["account_type"] == "ASSET":
+                asset_open = float(r["delta_amount"] or 0.0)
+            elif r["account_type"] == "LIAB":
+                liab_open = float(r["delta_amount"] or 0.0)
+        return asset_open, liab_open
+
+    def list_assets_trend(
+        self,
+        granularity: str = "day",
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        label_expr = "e.accounting_date" if granularity == "day" else "substr(e.accounting_date,1,7)"
+        sql = f"""
+        SELECT
+          {label_expr} AS label,
+          a.account_type,
+          SUM(CASE WHEN ei.dc='D' THEN ei.amount_domestic ELSE -ei.amount_domestic END) AS delta_amount
+        FROM gl_entry_item ei
+        JOIN gl_entry e   ON e.entry_uuid = ei.entry_uuid
+        JOIN gl_account a ON a.account_code = ei.account_code
+        WHERE a.is_active=1
+          AND a.account_type IN ('ASSET','LIAB')
+        """
+        params: List[Any] = []
+        if date_from:
+            sql += " AND e.accounting_date >= ?"
+            params.append(date_from)
+        if date_to:
+            sql += " AND e.accounting_date <= ?"
+            params.append(date_to)
+        sql += " GROUP BY label, a.account_type ORDER BY label ASC, a.account_type ASC"
+        rows = list(self.conn.execute(sql, params).fetchall())
+
+        buckets: Dict[str, Dict[str, float]] = {}
+        for r in rows:
+            label = r["label"]
+            acc_type = r["account_type"]
+            delta = float(r["delta_amount"] or 0.0)
+            if label not in buckets:
+                buckets[label] = {"ASSET": 0.0, "LIAB": 0.0}
+            buckets[label][acc_type] = delta
+
+        labels = sorted(buckets.keys())
+        asset_open, liab_open = self._opening_balances(date_from)
+        asset_bal = asset_open
+        liab_bal = liab_open
+
+        result: List[Dict[str, Any]] = []
+        for label in labels:
+            asset_bal += buckets[label].get("ASSET", 0.0)
+            liab_bal += buckets[label].get("LIAB", 0.0)
+            net = asset_bal - liab_bal
+            result.append(
+                {
+                    "label": label,
+                    "asset_balance": asset_bal,
+                    "liab_balance": liab_bal,
+                    "net_assets": net,
+                }
+            )
+        return result
 
 
 # -------------------------
@@ -1691,6 +1829,307 @@ class BalanceSheetOverviewWidget(QWidget):
         if data.get("kind") == "row" and self.on_open_account:
             self.on_open_account(data["account_code"], data["account_name"])
 
+
+# -------------------------
+# Chart widgets (Insight)
+# -------------------------
+
+class ChartFilterBar(QWidget):
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        today = QDate.currentDate()
+        default_from = today.addDays(-89)
+
+        self.date_from = QDateEdit()
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDate(default_from)
+        self.date_to = QDateEdit()
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDate(today)
+
+        self.granularity = QComboBox()
+        self.granularity.addItem("Day", "day")
+        self.granularity.addItem("Month", "month")
+        self._set_initial_granularity(default_from, today)
+
+        self.refresh_btn = QPushButton("Refresh")
+
+        layout.addWidget(QLabel("From"))
+        layout.addWidget(self.date_from)
+        layout.addWidget(QLabel("To"))
+        layout.addWidget(self.date_to)
+        layout.addWidget(QLabel("Granularity"))
+        layout.addWidget(self.granularity)
+        layout.addStretch(1)
+        layout.addWidget(self.refresh_btn)
+
+        self.date_from.dateChanged.connect(self._normalize_dates)
+        self.date_to.dateChanged.connect(self._normalize_dates)
+        self.granularity.currentIndexChanged.connect(self._emit_changed)
+        self.refresh_btn.clicked.connect(self._emit_changed)
+
+    def _set_initial_granularity(self, d_from: QDate, d_to: QDate):
+        if d_from.daysTo(d_to) > 45:
+            self.granularity.setCurrentIndex(1)  # Month
+        else:
+            self.granularity.setCurrentIndex(0)
+
+    def _normalize_dates(self):
+        if self.date_from.date() > self.date_to.date():
+            self.date_from.setDate(self.date_to.date())
+        self._emit_changed()
+
+    def _emit_changed(self):
+        self.changed.emit()
+
+    def get_date_from(self) -> str:
+        return qdate_to_iso(self.date_from.date())
+
+    def get_date_to(self) -> str:
+        return qdate_to_iso(self.date_to.date())
+
+    def get_granularity(self) -> str:
+        return self.granularity.currentData() or "day"
+
+
+class ExpenseTrendChart(QWidget):
+    def __init__(self, repo: Repo, parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self.dom = self.repo.get_domestic_currency()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.filters = ChartFilterBar()
+        layout.addWidget(self.filters)
+
+        self.placeholder = QLabel("No data")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setStyleSheet("color: #666;")
+
+        self.chart_view = QChartView()
+        self.chart_view.setRenderHint(QPainter.Antialiasing)
+        layout.addWidget(self.chart_view, 1)
+        layout.addWidget(self.placeholder, 1)
+        self.placeholder.hide()
+
+        self.filters.changed.connect(self.refresh)
+        self.refresh()
+
+    def refresh(self):
+        gran = self.filters.get_granularity()
+        date_from = self.filters.get_date_from()
+        date_to = self.filters.get_date_to()
+        rows = self.repo.list_expense_trend(granularity=gran, date_from=date_from, date_to=date_to)
+
+        if not rows:
+            self.chart_view.hide()
+            self.placeholder.setText("No expenses in this period")
+            self.placeholder.show()
+            return
+
+        labels: List[str] = []
+        label_index: Dict[str, int] = {}
+        categories: Dict[str, str] = {}
+        values: Dict[str, List[float]] = {}
+
+        for r in rows:
+            label = r["label"]
+            if label not in label_index:
+                label_index[label] = len(labels)
+                labels.append(label)
+            idx = label_index[label]
+
+            code = r["account_code"]
+            categories[code] = r["account_name"]
+            if code not in values:
+                values[code] = [0.0] * len(labels)
+            # Ensure list length matches labels
+            if len(values[code]) < len(labels):
+                values[code].extend([0.0] * (len(labels) - len(values[code])))
+            values[code][idx] += float(r["amount_domestic_sum"] or 0.0)
+
+        for vals in values.values():
+            if len(vals) < len(labels):
+                vals.extend([0.0] * (len(labels) - len(vals)))
+
+        series = QStackedBarSeries()
+        max_val = 0.0
+        for code, vals in values.items():
+            bar = QBarSet(categories.get(code, code))
+            col = color_for_key(code)
+            bar.setColor(col)
+            bar.setBorderColor(col.darker(115))
+            for v in vals:
+                bar.append(v)
+                max_val = max(max_val, v)
+            series.append(bar)
+
+        chart = QChart()
+        chart.addSeries(series)
+        chart.setTitle(f"Expense Trend ({gran})")
+        chart.legend().setVisible(True)
+        chart.legend().setAlignment(Qt.AlignBottom)
+        chart.setAnimationOptions(QChart.SeriesAnimations)
+
+        axis_x = QBarCategoryAxis()
+        axis_x.append(labels)
+        axis_y = QValueAxis()
+        axis_y.setLabelFormat("%.0f")
+        axis_y.applyNiceNumbers()
+        axis_y.setTitleText(self.dom)
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        series.attachAxis(axis_x)
+        series.attachAxis(axis_y)
+
+        for marker in chart.legend().markers(series):
+            marker.clicked.connect(lambda _, m=marker: self._toggle_marker(m))
+
+        self.chart_view.setChart(chart)
+        self.placeholder.hide()
+        self.chart_view.show()
+
+    @staticmethod
+    def _toggle_marker(marker):
+        target = getattr(marker, "barset", None)
+        barset = target() if callable(target) else marker.series()
+        if not barset:
+            return
+        barset.setVisible(not barset.isVisible())
+        marker.setVisible(True)
+        color = marker.labelBrush().color()
+        color.setAlpha(255 if barset.isVisible() else 80)
+        marker.setLabelBrush(color)
+
+
+class AssetsTrendChart(QWidget):
+    def __init__(self, repo: Repo, parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self.dom = self.repo.get_domestic_currency()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        self.filters = ChartFilterBar()
+        layout.addWidget(self.filters)
+
+        toggles = QHBoxLayout()
+        toggles.setContentsMargins(0, 0, 0, 0)
+        toggles.setSpacing(12)
+        toggles.addWidget(QLabel("Optional lines:"))
+        self.chk_assets = QCheckBox("Assets")
+        self.chk_liabs = QCheckBox("Liabilities")
+        toggles.addWidget(self.chk_assets)
+        toggles.addWidget(self.chk_liabs)
+        toggles.addStretch(1)
+        layout.addLayout(toggles)
+
+        self.chart_view = QChartView()
+        self.chart_view.setRenderHint(QPainter.Antialiasing)
+        self.placeholder = QLabel("No data")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setStyleSheet("color: #666;")
+
+        layout.addWidget(self.chart_view, 1)
+        layout.addWidget(self.placeholder, 1)
+        self.placeholder.hide()
+
+        self.filters.changed.connect(self.refresh)
+        self.chk_assets.stateChanged.connect(self.refresh)
+        self.chk_liabs.stateChanged.connect(self.refresh)
+
+        self.refresh()
+
+    def refresh(self):
+        gran = self.filters.get_granularity()
+        date_from = self.filters.get_date_from()
+        date_to = self.filters.get_date_to()
+        rows = self.repo.list_assets_trend(granularity=gran, date_from=date_from, date_to=date_to)
+
+        if not rows:
+            self.chart_view.hide()
+            self.placeholder.setText("No balance data in this period")
+            self.placeholder.show()
+            return
+
+        labels = [r["label"] for r in rows]
+        x_vals = list(range(len(labels)))
+
+        net_series = QLineSeries()
+        net_series.setName("Net assets")
+        net_pen = QPen(color_for_key("NET"))
+        net_pen.setWidth(2)
+        net_series.setPen(net_pen)
+
+        asset_series = QLineSeries()
+        asset_series.setName("Assets")
+        asset_series.setPen(QPen(color_for_key("ASSET"), 1.5))
+        liab_series = QLineSeries()
+        liab_series.setName("Liabilities")
+        liab_series.setPen(QPen(color_for_key("LIAB"), 1.5))
+
+        min_val = 0.0
+        max_val = 0.0
+
+        for i, r in enumerate(rows):
+            net = float(r["net_assets"])
+            net_series.append(float(i), net)
+            min_val = min(min_val, net)
+            max_val = max(max_val, net)
+            if self.chk_assets.isChecked():
+                a = float(r["asset_balance"])
+                asset_series.append(float(i), a)
+                min_val = min(min_val, a)
+                max_val = max(max_val, a)
+            if self.chk_liabs.isChecked():
+                l = float(r["liab_balance"])
+                liab_series.append(float(i), l)
+                min_val = min(min_val, l)
+                max_val = max(max_val, l)
+
+        chart = QChart()
+        chart.setTitle(f"Assets Trend ({gran})")
+        chart.setAnimationOptions(QChart.SeriesAnimations)
+
+        chart.addSeries(net_series)
+        if self.chk_assets.isChecked():
+            chart.addSeries(asset_series)
+        if self.chk_liabs.isChecked():
+            chart.addSeries(liab_series)
+
+        axis_x = QBarCategoryAxis()
+        axis_x.append(labels)
+        axis_y = QValueAxis()
+        axis_y.setLabelFormat("%.0f")
+        if max_val == min_val:
+            max_val += 1
+        axis_y.setRange(min_val * 1.05, max_val * 1.05)
+        axis_y.setTitleText(self.dom)
+
+        chart.addAxis(axis_x, Qt.AlignBottom)
+        chart.addAxis(axis_y, Qt.AlignLeft)
+        for s in chart.series():
+            s.attachAxis(axis_x)
+            s.attachAxis(axis_y)
+            s.setPointsVisible(True)
+
+        chart.legend().setVisible(True)
+        chart.legend().setAlignment(Qt.AlignBottom)
+
+        self.chart_view.setChart(chart)
+        self.placeholder.hide()
+        self.chart_view.show()
 
 # -------------------------
 # Dialogs
@@ -2933,21 +3372,20 @@ class InsightHome(QWidget):
 
         seg = QHBoxLayout()
         self.btn_expense = QPushButton("My Expenses")
-        self.btn_bs = QPushButton("My financial situation")
-        self.btn_expense.setCheckable(True)
-        self.btn_bs.setCheckable(True)
-        self.btn_expense.setChecked(True)
-        self.btn_expense.setMinimumHeight(36)
-        self.btn_bs.setMinimumHeight(36)
-        self.btn_expense.setMinimumWidth(120)
-        self.btn_bs.setMinimumWidth(120)
+        self.btn_bs = QPushButton("My Accounts")
+        self.btn_exp_trend = QPushButton("Expense Trend")
+        self.btn_assets_trend = QPushButton("Assets Trend")
+        for btn in (self.btn_expense, self.btn_bs, self.btn_exp_trend, self.btn_assets_trend):
+            btn.setCheckable(True)
+            btn.setMinimumHeight(36)
+            btn.setMinimumWidth(120)
         segment_style = """
             QPushButton {
                 background: #6e1d16;
                 color: #fef6e4;
                 border: 2px solid #6e1d16;
                 border-radius: 14px;
-                padding: 6px 14px;
+                padding: 1px 14px;
                 font-weight: 600;
             }
             QPushButton:checked {
@@ -2962,10 +3400,9 @@ class InsightHome(QWidget):
                 opacity: 0.95;
             }
         """
-        self.btn_expense.setStyleSheet(segment_style)
-        self.btn_bs.setStyleSheet(segment_style)
-        seg.addWidget(self.btn_expense)
-        seg.addWidget(self.btn_bs)
+        for btn in (self.btn_expense, self.btn_bs, self.btn_exp_trend, self.btn_assets_trend):
+            btn.setStyleSheet(segment_style)
+            seg.addWidget(btn)
         seg.addStretch(1)
         root.addLayout(seg)
 
@@ -2989,8 +3426,12 @@ class InsightHome(QWidget):
 
         self.page_expense = JournalCardList(repo, mode="expense")
         self.page_bs = BalanceSheetOverviewWidget(repo)
+        self.page_exp_trend = ExpenseTrendChart(repo)
+        self.page_assets_trend = AssetsTrendChart(repo)
         self.stack.addWidget(self.page_expense)
         self.stack.addWidget(self.page_bs)
+        self.stack.addWidget(self.page_exp_trend)
+        self.stack.addWidget(self.page_assets_trend)
 
         self.nav_stack: List[Tuple[int, str]] = []
 
@@ -2999,18 +3440,23 @@ class InsightHome(QWidget):
 
         self.btn_expense.clicked.connect(lambda: self.switch_root(0))
         self.btn_bs.clicked.connect(lambda: self.switch_root(1))
+        self.btn_exp_trend.clicked.connect(lambda: self.switch_root(2))
+        self.btn_assets_trend.clicked.connect(lambda: self.switch_root(3))
         self._set_segment_checked(0)
 
     def _set_segment_checked(self, idx: int):
         self.btn_expense.setChecked(idx == 0)
         self.btn_bs.setChecked(idx == 1)
+        self.btn_exp_trend.setChecked(idx == 2)
+        self.btn_assets_trend.setChecked(idx == 3)
 
     def switch_root(self, idx: int):
         self.nav_stack.clear()
         self.back.setEnabled(False)
         self.stack.setCurrentIndex(idx)
         self._set_segment_checked(idx)
-        self.title.setText("My Expenses" if idx == 0 else "My financial situation")
+        titles = ["My Expenses", "My Accounts", "Expense Trend", "Assets Trend"]
+        self.title.setText(titles[idx] if 0 <= idx < len(titles) else "")
         self.refresh_current()
 
     def refresh_current(self):
@@ -3019,12 +3465,17 @@ class InsightHome(QWidget):
             w.refresh()
         elif isinstance(w, BalanceSheetOverviewWidget):
             w.refresh()
+        elif isinstance(w, ExpenseTrendChart):
+            w.refresh()
+        elif isinstance(w, AssetsTrendChart):
+            w.refresh()
 
     def go_back(self):
         if not self.nav_stack:
             return
         idx, title = self.nav_stack.pop()
         self.stack.setCurrentIndex(idx)
+        self._set_segment_checked(idx)
         self.title.setText(title)
         self.back.setEnabled(len(self.nav_stack) > 0)
         self.refresh_current()
@@ -3049,6 +3500,8 @@ class InsightHome(QWidget):
     def refresh_all(self):
         self.page_expense.refresh()
         self.page_bs.refresh()
+        self.page_exp_trend.refresh()
+        self.page_assets_trend.refresh()
         self.refresh_current()
 
 
@@ -3164,12 +3617,34 @@ class MainWindow(QMainWindow):
         btn_text.setMinimumHeight(120)
 
         btn_manual_expense = QPushButton("Record expenses manually")
-        btn_manual_expense.setMinimumHeight(40)
+        btn_manual_expense.setMinimumHeight(48)
         btn_manual_expense.clicked.connect(self.new_expense)
 
         btn_manual_advanced = QPushButton("Record other transactions manually")
-        btn_manual_advanced.setMinimumHeight(40)
+        btn_manual_advanced.setMinimumHeight(48)
         btn_manual_advanced.clicked.connect(self.new_general)
+
+        feed_btn_style = """
+            QPushButton {
+                background: #6e1d16;
+                color: #fef6e4;
+                border: 2px solid #6e1d16;
+                border-radius: 18px;
+                padding: 12px 18px;
+                font-weight: 700;
+                font-size: 15px;
+            }
+            QPushButton:hover {
+                background: #843024;
+            }
+            QPushButton:pressed {
+                background: #f2c224;
+                color: #3b1c0f;
+                border-color: #e0ad1c;
+            }
+        """
+        for btn in (btn_camera, btn_file, btn_text, btn_manual_expense, btn_manual_advanced):
+            btn.setStyleSheet(feed_btn_style)
 
         btn_camera.clicked.connect(lambda: self._invoke_ai("camera"))
         btn_file.clicked.connect(lambda: self._invoke_ai("file"))
@@ -3196,7 +3671,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(feed, "Feed")
         tabs.addTab(debibi, "Debibi")
         tabs.addTab(self.insight, "Insight")
-        tabs.setCurrentIndex(2)
+        tabs.setCurrentIndex(1)
 
         container = QWidget()
         container.setObjectName("TabContainer")
@@ -3276,6 +3751,9 @@ def main():
     repo.seed_sample_data_if_empty()
 
     app = QApplication(sys.argv)
+    icon_path = os.path.join("assets", "debibi_icon.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     app.setStyleSheet(
         """
         QMainWindow, QDialog, QMessageBox {
