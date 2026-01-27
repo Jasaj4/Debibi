@@ -1,7 +1,10 @@
 .venv
 *.pyc
+__pycache__
+*.env
 dev
 test
+log
 poc
 *.db
 *.sqlite

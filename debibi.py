@@ -18,31 +18,63 @@ Notes:
 
 from __future__ import annotations
 
-import sys
-import os
+import datetime as dt
+import io
 import json
 import math
+import os
 import sqlite3
+import sys
+import tempfile
 import uuid
-import datetime as dt
+import warnings
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QSize, QDate
-from PySide6.QtGui import QAction, QFont
-from PySide6.QtCore import (
-    Qt, QSize, QDate, QByteArray, QBuffer, QIODevice, QPointF, QRectF, QSizeF
-)
-from PySide6.QtGui import (
-    QAction, QFont, QPixmap, QImage, QPainter
-)
+import pypdfium2 as pdfium
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types as genai_types
+from pdf2image import convert_from_bytes
+from PIL import Image
+from PySide6.QtCore import QBuffer, QByteArray, QDate, QIODevice, QPointF, QRectF, QSize, QSizeF, Qt, Signal, QThread, QObject
+from PySide6.QtGui import QAction, QFont, QImage, QPainter, QPixmap, QColor
+from PySide6.QtMultimedia import QCamera, QImageCapture, QMediaCaptureSession, QMediaDevices
+from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QListWidget, QListWidgetItem, QStackedWidget, QTabWidget, QToolButton, QMessageBox,
-    QDialog, QFormLayout, QLineEdit, QTextEdit, QDateEdit, QComboBox, QDoubleSpinBox,
-    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QCheckBox, QMenuBar,
-    QSizePolicy, QFileDialog
+    QApplication,
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenuBar,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QStackedWidget,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+    QHBoxLayout,
 )
+
+CAMERA_AVAILABLE = True
+PDF_RENDER_AVAILABLE = True
 
 
 # -------------------------
@@ -76,13 +108,6 @@ EXPENSE_ICON_BY_CODE = {
     "5000000009": "🧾",
     "5000000010": "🧩",
 }
-
-# Optional PDF rendering (for attachment thumbnails)
-try:
-    from PySide6.QtPdf import QPdfDocument
-    PDF_RENDER_AVAILABLE = True
-except Exception:
-    PDF_RENDER_AVAILABLE = False
 
 def bs_icon(account_code: str, account_type: str) -> str:
     if account_code == "0000000001":
@@ -139,29 +164,70 @@ def pixmap_from_image_bytes(data: bytes, max_size: QSize) -> Optional[QPixmap]:
         img = img.scaled(max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
     return QPixmap.fromImage(img)
 
-def pixmap_from_pdf_bytes(data: bytes, max_size: QSize) -> Optional[QPixmap]:
-    if not PDF_RENDER_AVAILABLE:
-        return None
-    doc = QPdfDocument()
-    buf = QBuffer()
-    buf.setData(QByteArray(data))
-    buf.open(QIODevice.ReadOnly)
-    err = doc.load(buf)
+def _pdf_to_png_bytes(data: bytes) -> Optional[bytes]:
+    """Convert first page of a PDF to PNG bytes using available backends."""
     try:
-        ok_value = QPdfDocument.Error.NoError  # Qt 6.5+
-    except AttributeError:
-        ok_value = getattr(QPdfDocument, "NoError", 0)  # older enum style
-    if err != ok_value or doc.pageCount() == 0:
-        return None
-    page_size = doc.pagePointSize(0)
-    img = QImage(page_size.toSize(), QImage.Format_ARGB32)
-    img.fill(Qt.white)
-    painter = QPainter(img)
-    doc.render(painter, 0, QRectF(QPointF(0, 0), QSizeF(page_size)))
-    painter.end()
-    if max_size.width() > 0 and max_size.height() > 0:
-        img = img.scaled(max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    return QPixmap.fromImage(img)
+        with pdfium.PdfDocument(data) as pdf:
+            if len(pdf) < 1:
+                return None
+            page = pdf[0]
+            pil_image = page.render(scale=2).to_pil()
+        buf = io.BytesIO()
+        pil_image.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        pass
+
+    try:
+        images = convert_from_bytes(data, first_page=1, last_page=1, fmt="png")
+        if images:
+            buf = io.BytesIO()
+            images[0].save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception:
+        pass
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            img = Image.open(io.BytesIO(data))
+            img.load()
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception:
+        pass
+
+    return None
+
+def pixmap_from_pdf_bytes(data: bytes, max_size: QSize) -> Optional[QPixmap]:
+    # Try QtPdf first (fastest when available)
+    if PDF_RENDER_AVAILABLE:
+        doc = QPdfDocument()
+        buf = QBuffer()
+        buf.setData(QByteArray(data))
+        buf.open(QIODevice.ReadOnly)
+        err = doc.load(buf)
+        try:
+            ok_value = QPdfDocument.Error.NoError  # Qt 6.5+
+        except AttributeError:
+            ok_value = getattr(QPdfDocument, "NoError", 0)  # older enum style
+        if err == ok_value and doc.pageCount() > 0:
+            page_size = doc.pagePointSize(0)
+            img = QImage(page_size.toSize(), QImage.Format_ARGB32)
+            img.fill(Qt.white)
+            painter = QPainter(img)
+            doc.render(painter, 0, QRectF(QPointF(0, 0), QSizeF(page_size)))
+            painter.end()
+            if max_size.width() > 0 and max_size.height() > 0:
+                img = img.scaled(max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            return QPixmap.fromImage(img)
+
+    # Fallback: convert to PNG via external libs
+    png_bytes = _pdf_to_png_bytes(data)
+    if png_bytes:
+        return pixmap_from_image_bytes(png_bytes, max_size)
+    return None
 
 
 # -------------------------
@@ -785,9 +851,9 @@ class JsonExpenseImportService:
                 raise JsonExpenseImportError(f"lines[{idx}].note must be 500 characters or less.")
             ln_note = ln_note.strip() or None
 
-        amt_dom = self._parse_positive_number(line.get("amount_domestic"), f"lines[{idx}].amount_domestic")
+        amt_dom = self._parse_nonzero_number(line.get("amount_domestic"), f"lines[{idx}].amount_domestic")
         amt_org_raw = line.get("amount_original")
-        amt_org = self._parse_positive_number(
+        amt_org = self._parse_nonzero_number(
             amt_org_raw if amt_org_raw is not None else amt_dom,
             f"lines[{idx}].amount_original"
         )
@@ -825,8 +891,8 @@ class JsonExpenseImportService:
             total_dom += float(ln["amount_domestic"])
             total_org += float(ln["amount_original"])
 
-        if total_dom <= 0:
-            raise JsonExpenseImportError("Total amount_domestic must be greater than zero.")
+        if abs(total_dom) <= 1e-9:
+            raise JsonExpenseImportError("Total amount_domestic must not be zero.")
 
         items.append(
             {
@@ -847,13 +913,13 @@ class JsonExpenseImportService:
         return items, total_dom, total_org
 
     @staticmethod
-    def _parse_positive_number(value: Any, field_name: str) -> float:
+    def _parse_nonzero_number(value: Any, field_name: str) -> float:
         try:
             num = float(value)
         except Exception:
-            raise JsonExpenseImportError(f"{field_name} must be a positive number.") from None
-        if not math.isfinite(num) or num <= 0:
-            raise JsonExpenseImportError(f"{field_name} must be a positive number.")
+            raise JsonExpenseImportError(f"{field_name} must be a non-zero number.") from None
+        if not math.isfinite(num) or abs(num) < 1e-9:
+            raise JsonExpenseImportError(f"{field_name} must be a non-zero number.")
         return num
 
     @staticmethod
@@ -870,6 +936,526 @@ class JsonExpenseImportService:
 
 
 # -------------------------
+# Gemini / AI Import helpers
+# -------------------------
+
+
+class GeminiClientError(Exception):
+    pass
+
+
+class PromptBuilder:
+    """Builds system prompt with live schema and enum values."""
+
+    def __init__(self, repo: Repo, schema_path: str):
+        self.repo = repo
+        self.schema_path = schema_path
+        self._schema_template: Optional[str] = None
+
+    def _load_schema_template(self) -> str:
+        if self._schema_template is None:
+            with open(self.schema_path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            try:
+                # Minify schema to single line to reduce prompt noise
+                schema_obj = json.loads(raw)
+                self._schema_template = json.dumps(schema_obj, separators=(",", ":"), ensure_ascii=False)
+            except json.JSONDecodeError:
+                self._schema_template = raw
+        return self._schema_template
+
+    def build_prompt(self) -> str:
+        schema = self._load_schema_template()
+        pay_names = [r["account_name"] for r in self.repo.list_payment_accounts()]
+        exp_names = [r["account_name"] for r in self.repo.list_expense_categories()]
+        dom = self.repo.get_domestic_currency() or "GBP"
+
+        schema = schema.replace('"{PAYMENT_ACCOUNT_NAME_ENUM}"', json.dumps(pay_names))
+        schema = schema.replace('"{EXPENSE_ACCOUNT_NAME_ENUM}"', json.dumps(exp_names))
+        schema = schema.replace("{USER_DOMESTIC_CURRENCY}", dom)
+
+        prompt = (
+            "You are a personal accounting professional. Output one JSON object ONLY.\n"
+            "- Follow this JSON Schema strictly (no extra fields, no comments):\n"
+            f"{schema}\n"
+            f"- Use these payment accounts exactly as written: {', '.join(pay_names)}\n"
+            f"- Use these expense categories exactly as written: {', '.join(exp_names)}\n"
+            f"- Domestic currency: {dom}\n"
+            "- If date is absent, set null.\n"
+            "- If store/notes unreadable, set null.\n"
+            "- Amounts must be non-zero numbers (positive or negative); sum(lines.amount_domestic) must equal the payment line.\n"
+            "- Prefer grouping identical expense_category lines into one item by summing their amounts (one line per expense category when possible).\n"
+            "- If the receipt shows discounts/coupons/savings/rounding/tax and the item sum differs from the receipt total, add ONE extra line with expense_category \"Other expenses\" and a NEGATIVE amount (both domestic and original) so the sums tie; if the item sum already matches the receipt total, do NOT add a savings line.\n"
+            "- Output must be the full JSON object conforming to the schema (no missing required fields), plain JSON only (no markdown fences)."
+        )
+        return prompt
+
+
+class GeminiClient:
+    """Thin wrapper over google genai client with JSON-only contract."""
+
+    def __init__(self):
+        load_dotenv()
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        self.model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        if not self.api_key:
+            raise GeminiClientError("GEMINI_API_KEY not set (.env or environment).")
+        if genai is None:
+            raise GeminiClientError("google-genai package not installed. pip install google-genai")
+        if genai_types is None:
+            raise GeminiClientError("google-genai types missing. Verify installation.")
+        self.client = genai.Client(api_key=self.api_key)
+
+    def _upload_temp(self, data: bytes, file_name: str, mime_type: str):
+        # genai client expects a file path; use temp file to avoid keeping artifacts
+        suffix = ""
+        if file_name and "." in file_name:
+            suffix = "." + file_name.rsplit(".", 1)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        try:
+            cfg = {}
+            if file_name:
+                cfg["display_name"] = file_name
+            if mime_type:
+                cfg["mime_type"] = mime_type
+            uploaded = self.client.files.upload(
+                file=tmp_path,
+                config=cfg if cfg else None,
+            )
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return uploaded
+
+    @staticmethod
+    def _strip_fences(text: str) -> str:
+        if text.startswith("```"):
+            text = text.strip()
+            if text.startswith("```"):
+                text = text.split("```", 2)[1] if "```" in text[3:] else text[3:]
+            text = text.strip()
+        return text
+
+    def _parse_json_text(self, text: str) -> Any:
+        cleaned = self._strip_fences(text)
+        return json.loads(cleaned)
+
+    def generate_json(
+        self,
+        system_prompt: str,
+        user_text: Optional[str] = None,
+        file_bytes: Optional[bytes] = None,
+        mime_type: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> Any:
+        if not user_text and not file_bytes:
+            raise GeminiClientError("Either text or file_bytes must be provided.")
+
+        uploaded = None
+        contents: List[Any] = []
+        if file_bytes:
+            uploaded = self._upload_temp(file_bytes, file_name or "attachment", mime_type or "")
+            contents.append(uploaded)
+            contents.append("\n\nExtract all receipt text first, then map to schema.")
+        if user_text:
+            contents.append(user_text)
+
+        def _call() -> str:
+            config = genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                response_mime_type="application/json",
+                temperature=0.2,
+                max_output_tokens=2048,
+            )
+            resp = self.client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+            text = getattr(resp, "text", None)
+            if not text and hasattr(resp, "candidates"):
+                for cand in resp.candidates:
+                    parts = getattr(cand, "content", None)
+                    if not parts:
+                        continue
+                    for p in getattr(parts, "parts", []):
+                        if hasattr(p, "text"):
+                            text = p.text
+                            break
+                    if text:
+                        break
+            if not text:
+                raise GeminiClientError("Gemini returned empty response.")
+            return text
+
+        first_text = _call()
+        try:
+            return self._parse_json_text(first_text)
+        except Exception as e:
+            # one retry for JSON parse failure
+            retry_text = _call()
+            try:
+                return self._parse_json_text(retry_text)
+            except Exception as e2:
+                raise GeminiClientError(f"Failed to parse JSON from Gemini. Raw response:\n{retry_text}") from e2
+
+
+class GeminiWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, client: GeminiClient, prompt: str, user_text: Optional[str], file_bytes: Optional[bytes], mime_type: Optional[str], file_name: Optional[str]):
+        super().__init__()
+        self.client = client
+        self.prompt = prompt
+        self.user_text = user_text
+        self.file_bytes = file_bytes
+        self.mime_type = mime_type
+        self.file_name = file_name
+
+    def run(self):
+        try:
+            payload = self.client.generate_json(
+                system_prompt=self.prompt,
+                user_text=self.user_text,
+                file_bytes=self.file_bytes,
+                mime_type=self.mime_type,
+                file_name=self.file_name,
+            )
+            self.finished.emit(payload)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class BusyOverlay(QWidget):
+    """Simple full-screen overlay with Debibi loading image."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("background: rgba(0,0,0,0.35);")
+        self.setVisible(False)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setAlignment(Qt.AlignCenter)
+
+        self.img = QLabel()
+        pix = QPixmap(os.path.join("assets", "debibi_loading.png"))
+        if not pix.isNull():
+            self.img.setPixmap(pix.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.img.setAlignment(Qt.AlignCenter)
+
+        self.msg = QLabel("Debibi chewing on your receipt…")
+        self.msg.setStyleSheet("color: white; font-size: 16px;")
+        self.msg.setAlignment(Qt.AlignCenter)
+
+        lay.addWidget(self.img)
+        lay.addSpacing(12)
+        lay.addWidget(self.msg)
+
+    def show_message(self, text: str):
+        self.msg.setText(text)
+        if self.parent():
+            self.setGeometry(self.parent().rect())
+        self.show()
+        self.raise_()
+
+    def hide_overlay(self):
+        self.hide()
+
+
+class FreeTextImportDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Text to Debibi")
+        self.resize(480, 320)
+        v = QVBoxLayout(self)
+        lbl = QLabel("Paste any receipt or expense text below:")
+        self.text = QTextEdit()
+        btns = QHBoxLayout()
+        ok = QPushButton("Feed")
+        cancel = QPushButton("Cancel")
+        ok.setDefault(True)
+        ok.setAutoDefault(True)
+        cancel.setAutoDefault(False)
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        btns.addStretch(1)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        v.addWidget(lbl)
+        v.addWidget(self.text, 1)
+        v.addLayout(btns)
+
+    def get_text(self) -> str:
+        return self.text.toPlainText().strip()
+
+
+class CameraCaptureDialog(QDialog):
+    """Lightweight camera picker. Falls back to file chooser if camera is unavailable."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Camera Capture")
+        self.resize(520, 420)
+        self.captured_bytes: Optional[bytes] = None
+        self.captured_mime: Optional[str] = None
+        self.captured_name: Optional[str] = None
+
+        if not CAMERA_AVAILABLE or not QMediaDevices.videoInputs():
+            QMessageBox.warning(self, "Camera unavailable", "No camera devices detected. Please pick an image file instead.")
+            self._fallback_file()
+            return
+
+        self.view = QVideoWidget()
+        self.session = QMediaCaptureSession()
+        self.camera = QCamera(QMediaDevices.videoInputs()[0])
+        self.capture = QImageCapture()
+        self.session.setCamera(self.camera)
+        self.session.setVideoOutput(self.view)
+        self.session.setImageCapture(self.capture)
+        self.capture.imageCaptured.connect(self._on_captured)
+
+        btns = QHBoxLayout()
+        self.btn_capture = QPushButton("Shoot")
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_capture.setDefault(True)
+        self.btn_capture.setAutoDefault(True)
+        self.btn_cancel.setAutoDefault(False)
+        btns.addStretch(1)
+        btns.addWidget(self.btn_cancel)
+        btns.addWidget(self.btn_capture)
+
+        v = QVBoxLayout(self)
+        v.addWidget(self.view, 1)
+        v.addLayout(btns)
+
+        self.btn_capture.clicked.connect(self._capture)
+        self.btn_cancel.clicked.connect(self.reject)
+        self.camera.start()
+
+    def _fallback_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select image",
+            "",
+            "Images (*.jpg *.jpeg *.png)"
+        )
+        if not path:
+            self.reject()
+            return
+        mime = guess_mime_from_path(path)
+        if mime not in ("image/jpeg", "image/png"):
+            QMessageBox.warning(self, "Invalid file", "Only JPG/PNG allowed.")
+            self.reject()
+            return
+        size = os.path.getsize(path)
+        if size > ATTACH_MAX_BYTES:
+            QMessageBox.warning(self, "File too large", "File must be 10MB or smaller.")
+            self.reject()
+            return
+        with open(path, "rb") as f:
+            self.captured_bytes = f.read()
+        self.captured_mime = mime
+        self.captured_name = os.path.basename(path)
+        self.accept()
+
+    def _capture(self):
+        if not CAMERA_AVAILABLE:
+            self.reject()
+            return
+        self.capture.captureToFile("")  # triggers imageCaptured
+
+    def _on_captured(self, _id, image: QImage):
+        buf = QBuffer()
+        buf.open(QIODevice.ReadWrite)
+        image.save(buf, "JPG")
+        self.captured_bytes = bytes(buf.data())
+        self.captured_mime = "image/jpeg"
+        self.captured_name = "camera.jpg"
+        self.accept()
+
+
+class AiImportController(QObject):
+    """Coordinates UI actions -> Gemini -> import service."""
+
+    def __init__(
+        self,
+        repo: Repo,
+        importer: JsonExpenseImportService,
+        prompt_builder: PromptBuilder,
+        gemini_client: GeminiClient,
+        overlay: BusyOverlay,
+        open_entry: Callable[[str, bool], None],
+        refresh: Callable[[], None],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.repo = repo
+        self.importer = importer
+        self.prompt_builder = prompt_builder
+        self.gemini_client = gemini_client
+        self.overlay = overlay
+        self.open_entry = open_entry
+        self.refresh = refresh
+        self.parent_widget = parent
+        self._running_threads: List[QThread] = []
+        self._job_ctx: Optional[Dict[str, Any]] = None
+        self.log_dir = os.path.join(os.path.dirname(__file__), "log")
+
+    def import_from_text(self):
+        dlg = FreeTextImportDialog(self.parent_widget)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        text = dlg.get_text()
+        if not text:
+            QMessageBox.warning(self.parent_widget, "Validation", "テキストを入力してください。")
+            return
+        self._start_worker(source="text", user_text=text)
+
+    def import_from_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self.parent_widget,
+            "ファイルから取り込む",
+            "",
+            "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
+        )
+        if not path:
+            return
+        mime = guess_mime_from_path(path)
+        if mime not in ALLOWED_MIME:
+            QMessageBox.warning(self.parent_widget, "Invalid file", "Only JPG, PNG, or PDF files are allowed.")
+            return
+        size = os.path.getsize(path)
+        if size > ATTACH_MAX_BYTES:
+            QMessageBox.warning(self.parent_widget, "File too large", "File must be 10MB or smaller.")
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            QMessageBox.critical(self.parent_widget, "Error", f"Failed to read file: {e}")
+            return
+        self._start_worker(source="file", file_bytes=data, mime_type=mime, file_name=os.path.basename(path))
+
+    def import_from_camera(self):
+        dlg = CameraCaptureDialog(self.parent_widget)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        if not dlg.captured_bytes or not dlg.captured_mime:
+            QMessageBox.warning(self.parent_widget, "Camera error", "No image captured.")
+            return
+        self._start_worker(
+            source="camera",
+            file_bytes=dlg.captured_bytes,
+            mime_type=dlg.captured_mime,
+            file_name=dlg.captured_name or "camera.jpg",
+        )
+
+    def _start_worker(
+        self,
+        source: str,
+        user_text: Optional[str] = None,
+        file_bytes: Optional[bytes] = None,
+        mime_type: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ):
+        if self._job_ctx:
+            QMessageBox.information(self.parent_widget, "Busy", "Another import is running. Please wait.")
+            return
+        try:
+            prompt = self.prompt_builder.build_prompt()
+        except Exception as e:
+            QMessageBox.critical(self.parent_widget, "Prompt error", str(e))
+            return
+
+        try:
+            worker = GeminiWorker(self.gemini_client, prompt, user_text, file_bytes, mime_type, file_name)
+        except Exception as e:
+            QMessageBox.critical(self.parent_widget, "Gemini error", str(e))
+            return
+
+        thread = QThread()
+        worker.moveToThread(thread)
+        self._job_ctx = {
+            "thread": thread,
+            "worker": worker,
+            "file_bytes": file_bytes,
+            "mime_type": mime_type,
+            "file_name": file_name,
+        }
+        worker.finished.connect(self._on_worker_success, Qt.QueuedConnection)
+        worker.failed.connect(self._on_worker_failed, Qt.QueuedConnection)
+        thread.started.connect(worker.run)
+        self.overlay.show_message("Debibi chewing on your receipt…")
+        self._running_threads.append(thread)
+        thread.start()
+
+    def _cleanup_thread(self):
+        ctx = self._job_ctx or {}
+        thread: Optional[QThread] = ctx.get("thread")
+        worker: Optional[GeminiWorker] = ctx.get("worker")
+        if thread:
+            thread.quit()
+            thread.wait()
+        if worker:
+            worker.deleteLater()
+        if thread:
+            thread.deleteLater()
+            if thread in self._running_threads:
+                self._running_threads.remove(thread)
+        self._job_ctx = None
+
+    def _on_worker_failed(self, message: str):
+        self.overlay.hide_overlay()
+        # Capture raw response if the parse step failed
+        raw_start = "Failed to parse JSON from Gemini. Raw response:"
+        if message.startswith(raw_start):
+            raw = message[len(raw_start):].strip()
+            self._save_failed_payload(raw)
+        QMessageBox.critical(self.parent_widget, "LLM error", message)
+        self._cleanup_thread()
+
+    def _on_worker_success(self, payload: Any):
+        ctx = self._job_ctx or {}
+        file_bytes = ctx.get("file_bytes")
+        mime_type = ctx.get("mime_type")
+        file_name = ctx.get("file_name")
+        try:
+            result = self.importer.import_payload(payload)
+            if file_bytes and mime_type:
+                try:
+                    self.repo.upsert_attachment(result.entry_uuid, file_name, mime_type, file_bytes)
+                except Exception as e:
+                    QMessageBox.warning(self.parent_widget, "Attachment warning", f"Import succeeded but attachment failed: {e}")
+            self.open_entry(result.entry_uuid, True)
+            self.refresh()
+        except Exception as e:
+            self._save_failed_payload(payload)
+            QMessageBox.critical(self.parent_widget, "Validation failed", str(e))
+        finally:
+            self.overlay.hide_overlay()
+            self._cleanup_thread()
+
+    def _save_failed_payload(self, payload: Any):
+        """Persist LLM payload for debugging when import fails."""
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = os.path.join(self.log_dir, f"{ts}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            # Swallow logging errors; don't block the UI
+            pass
+
+
+# -------------------------
 # UI: Reusable list widgets
 # -------------------------
 
@@ -880,6 +1466,10 @@ class SectionHeaderItem(QListWidgetItem):
         f.setBold(True)
         self.setFont(f)
         self.setFlags(Qt.ItemIsEnabled)  # not selectable
+        self.setBackground(QColor("#e0e0e0"))
+        self.setForeground(QColor("#2d2018"))
+        self.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setSizeHint(QSize(10, 32))
         self.setData(Qt.UserRole, {"kind": "section"})
 
 
@@ -911,6 +1501,84 @@ class CardRowItem(QListWidgetItem):
         super().__init__("")
         self.setSizeHint(QSize(10, 44))
         self.setData(Qt.UserRole, payload)
+
+
+class ClickableLabel(QLabel):
+    clicked = Signal()
+
+    def mousePressEvent(self, event):
+        if event and event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class AttachmentViewerDialog(QDialog):
+    """Simple resizable window that scales an attachment pixmap to fill the client area."""
+
+    def __init__(self, pixmap: QPixmap, title: str, file_bytes: Optional[bytes], default_name: Optional[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title or "Attachment")
+        self.setModal(False)
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        self._orig_pixmap = pixmap
+        self._file_bytes = file_bytes or b""
+        self._default_name = default_name or "attachment"
+
+        self.label = QLabel()
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setMinimumSize(0, 0)
+        # Allow the dialog to shrink freely; ignore pixmap size hints.
+        self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+
+        self.save_btn = QPushButton("Save")
+        self.save_btn.clicked.connect(self._save_attachment)
+        self.save_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(8, 8, 8, 0)
+        top.addStretch(1)
+        top.addWidget(self.save_btn)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addLayout(top)
+        lay.addWidget(self.label)
+
+        self.setMinimumSize(320, 240)
+        self.resize(900, 700)
+        self._apply_scaled_pixmap()
+
+    def _apply_scaled_pixmap(self):
+        if not self._orig_pixmap or self._orig_pixmap.isNull():
+            self.label.setPixmap(QPixmap())
+            self.label.setText("Preview unavailable")
+            return
+        target = self.label.size()
+        if target.width() < 2 or target.height() < 2:
+            target = QSize(10, 10)
+        scaled = self._orig_pixmap.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.label.setPixmap(scaled)
+        self.label.setText("")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_scaled_pixmap()
+
+    def _save_attachment(self):
+        if not self._file_bytes:
+            QMessageBox.warning(self, "Attachment", "No attachment data to save.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save attachment", self._default_name)
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(self._file_bytes)
+            QMessageBox.information(self, "Saved", "Attachment saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
 
 
 class JournalCardList(QWidget):
@@ -1029,12 +1697,13 @@ class BalanceSheetOverviewWidget(QWidget):
 # -------------------------
 
 class ExpenseJournalDetailDialog(QDialog):
-    def __init__(self, repo: Repo, entry_uuid: Optional[str] = None, parent=None):
+    def __init__(self, repo: Repo, entry_uuid: Optional[str] = None, parent=None, start_edit_mode: bool = False):
         super().__init__(parent)
         self.repo = repo
         self.dom = self.repo.get_domestic_currency()
         self.entry_uuid = entry_uuid
         self.is_new = entry_uuid is None
+        self.start_edit_mode = start_edit_mode
 
         self.setWindowTitle("Expense Journal Detail" if self.is_new else "Expense Journal Detail (View/Edit)")
         self.resize(400, 620)  # compact, dialog-like width slightly smaller than main window
@@ -1128,7 +1797,10 @@ class ExpenseJournalDetailDialog(QDialog):
             self.add_line()
         else:
             self.load_entry()
-            self.set_view_mode()
+            if self.start_edit_mode:
+                self.set_edit_mode()
+            else:
+                self.set_view_mode()
 
     def _load_categories(self):
         self.cat_map.clear()
@@ -1136,11 +1808,12 @@ class ExpenseJournalDetailDialog(QDialog):
             self.cat_map[r["account_name"]] = r["account_code"]
 
     def _build_attachment_ui(self, form: QFormLayout):
-        self.attach_preview = QLabel("No attachment")
+        self.attach_preview = ClickableLabel("No attachment")
         self.attach_preview.setAlignment(Qt.AlignLeft)
         self.attach_preview.setMinimumSize(240, 160)
         self.attach_preview.setMaximumSize(320, 220)
         self.attach_preview.setStyleSheet("border: 1px solid #ccc; background: #fafafa;")
+        self.attach_preview.clicked.connect(self.on_attachment_clicked)
 
         self.attach_name_lbl = QLabel("None")
         self.attach_name_lbl.setStyleSheet("color: #666;")
@@ -1166,6 +1839,52 @@ class ExpenseJournalDetailDialog(QDialog):
         wrap.setContentsMargins(0, 0, 0, 0)
         form.addRow("Attachment", wrap)
 
+    def _has_attachment(self) -> bool:
+        return (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
+
+    def _attachment_pixmap_full(self) -> Optional[QPixmap]:
+        if not self.attach_data or not self.attach_mime:
+            return None
+        if self.attach_mime in ("image/jpeg", "image/png"):
+            return pixmap_from_image_bytes(self.attach_data, QSize(0, 0))
+        return None
+
+    def _open_attachment_viewer(self):
+        pixmap = self._attachment_pixmap_full()
+        if not pixmap or pixmap.isNull():
+            QMessageBox.information(self, "Attachment", "Preview is not available for this file.")
+            return
+        dlg = AttachmentViewerDialog(pixmap, self.attach_name or "Attachment", self.attach_data, self.attach_name, self)
+        dlg.show()
+
+    def _download_attachment(self):
+        if not self.attach_data:
+            QMessageBox.warning(self, "Attachment", "Attachment data is missing.")
+            return
+        default = self.attach_name or "attachment"
+        if self.attach_mime == "application/pdf" and not default.lower().endswith(".pdf"):
+            default += ".pdf"
+        path, _ = QFileDialog.getSaveFileName(self, "Save attachment", default)
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(self.attach_data)
+            QMessageBox.information(self, "Saved", "Attachment saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+
+    def on_attachment_clicked(self):
+        if not self._has_attachment():
+            return
+        if not self.attach_data:
+            QMessageBox.warning(self, "Attachment", "Attachment is not loaded in memory.")
+            return
+        if self.attach_mime == "application/pdf":
+            self._download_attachment()
+        else:
+            self._open_attachment_viewer()
+
     def _show_note_field(self):
         if self.view_mode:
             return
@@ -1180,77 +1899,6 @@ class ExpenseJournalDetailDialog(QDialog):
         show_note = has_text or self.note_shown_with_empty
         self.note.setVisible(show_note)
         self.note_add_btn.setVisible(not show_note)
-
-    def _refresh_original_amount_header(self, ccy: str):
-        ccy = (ccy or "").strip().upper()
-        label = f"Amount ({ccy})" if ccy else "Amount"
-        item = self.table.horizontalHeaderItem(2)
-        if item:
-            item.setText(label)
-        else:
-            self.table.setHorizontalHeaderItem(2, QTableWidgetItem(label))
-
-    def _update_attachment_preview(self):
-        max_size = QSize(300, 200)
-        pixmap: Optional[QPixmap] = None
-        if self.attach_data and self.attach_mime:
-            if self.attach_mime in ("image/jpeg", "image/png"):
-                pixmap = pixmap_from_image_bytes(self.attach_data, max_size)
-            elif self.attach_mime == "application/pdf":
-                pixmap = pixmap_from_pdf_bytes(self.attach_data, max_size)
-        if pixmap:
-            self.attach_preview.setPixmap(pixmap)
-            self.attach_preview.setScaledContents(False)
-        else:
-            self.attach_preview.setPixmap(QPixmap())
-            self.attach_preview.setText("No attachment" if not self.attach_deleted else "Will remove on save")
-
-        name_text = self.attach_name if self.attach_name else "None"
-        if self.attach_deleted:
-            name_text += " (removed)"
-        self.attach_name_lbl.setText(name_text)
-        self.attach_remove_btn.setEnabled(
-            not self.view_mode and (self.attach_data is not None or self.attach_existing_present or self.attach_deleted)
-        )
-
-    def on_select_attachment(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select attachment",
-            "",
-            "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
-        )
-        if not path:
-            return
-        mime = guess_mime_from_path(path)
-        if mime not in ALLOWED_MIME:
-            QMessageBox.warning(self, "Invalid file", "Only JPG, PNG, or PDF files are allowed.")
-            return
-        size = os.path.getsize(path)
-        if size > ATTACH_MAX_BYTES:
-            QMessageBox.warning(self, "File too large", "File must be 10MB or smaller.")
-            return
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
-            return
-
-        self.attach_data = data
-        self.attach_mime = mime
-        self.attach_name = os.path.basename(path)
-        self.attach_deleted = False
-        # existing attachment will be replaced on save
-        self._update_attachment_preview()
-
-    def on_remove_attachment(self):
-        self.attach_data = None
-        self.attach_mime = None
-        self.attach_name = None
-        self.attach_deleted = True
-        self.attach_existing_present = False
-        self._update_attachment_preview()
 
     def _refresh_original_amount_header(self, ccy: str):
         ccy = (ccy or "").strip().upper()
@@ -1309,7 +1957,7 @@ class ExpenseJournalDetailDialog(QDialog):
 
     def _update_attachment_preview(self):
         max_size = QSize(300, 200)
-        has_attachment = (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
+        has_attachment = self._has_attachment()
         pixmap: Optional[QPixmap] = None
         if has_attachment and self.attach_data and self.attach_mime:
             if self.attach_mime in ("image/jpeg", "image/png"):
@@ -1325,10 +1973,22 @@ class ExpenseJournalDetailDialog(QDialog):
                 self.attach_preview.setText("")
             else:
                 self.attach_preview.setPixmap(QPixmap())
-                self.attach_preview.setText("Preview not available")
+                msg = "Preview not available"
+                if self.attach_mime == "application/pdf":
+                    msg = "PDF attached - click to download"
+                self.attach_preview.setText(msg)
         else:
             self.attach_preview.setPixmap(QPixmap())
             self.attach_preview.setText("")
+
+        self.attach_preview.setCursor(Qt.PointingHandCursor if has_attachment else Qt.ArrowCursor)
+        if has_attachment:
+            if self.attach_mime == "application/pdf":
+                self.attach_preview.setToolTip("Click to download the PDF attachment")
+            else:
+                self.attach_preview.setToolTip("Click to view the attachment in a larger window")
+        else:
+            self.attach_preview.setToolTip("")
 
         name_text = self.attach_name if self.attach_name else "None"
         if self.attach_deleted:
@@ -1386,13 +2046,13 @@ class ExpenseJournalDetailDialog(QDialog):
         self.table.setCellWidget(row, 0, cat)
 
         sp = QDoubleSpinBox()
-        sp.setRange(0, 10_000_000)
+        sp.setRange(-10_000_000, 10_000_000)
         sp.setDecimals(2)
         sp.setSingleStep(1.0)
         self.table.setCellWidget(row, 1, sp)
 
         sp2 = QDoubleSpinBox()
-        sp2.setRange(0, 10_000_000)
+        sp2.setRange(-10_000_000, 10_000_000)
         sp2.setDecimals(2)
         sp2.setSingleStep(1.0)
         self.table.setCellWidget(row, 2, sp2)
@@ -1442,7 +2102,7 @@ class ExpenseJournalDetailDialog(QDialog):
 
         pay_code = None
         for it in items:
-            if it["account_type"] == "ASSET" and it["dc"] == "C":
+            if it["account_type"] in ("ASSET", "LIAB") and it["dc"] == "C":
                 pay_code = it["account_code"]
                 break
         if pay_code:
@@ -1486,12 +2146,12 @@ class ExpenseJournalDetailDialog(QDialog):
             if not code:
                 raise ValueError("Invalid expense category selection")
             amt_dom = float(sp.value())
-            if amt_dom <= 0:
-                continue
+            if abs(amt_dom) < 1e-9:
+                continue  # allow negative; just skip true zero rows
             if is_foreign:
                 amt_org = float(sp2.value())
-                if amt_org <= 0:
-                    raise ValueError("Original amount is required when currency is foreign")
+                if abs(amt_org) < 1e-9:
+                    raise ValueError("Original amount is required when currency is foreign and cannot be zero")
             else:
                 amt_org = amt_dom
             items.append({
@@ -1506,7 +2166,7 @@ class ExpenseJournalDetailDialog(QDialog):
             total_org += amt_org
 
         if not items:
-            raise ValueError("Add at least one expense line with amount > 0")
+            raise ValueError("Add at least one expense line with non-zero amount")
 
         pay_name = self.payment.currentText()
         pay_code = self.payment_map.get(pay_name)
@@ -1671,11 +2331,12 @@ class GeneralJournalDetailDialog(QDialog):
                 self.set_view_mode()
 
     def _build_attachment_ui(self, form: QFormLayout):
-        self.attach_preview = QLabel("No attachment")
+        self.attach_preview = ClickableLabel("No attachment")
         self.attach_preview.setAlignment(Qt.AlignLeft)
         self.attach_preview.setMinimumSize(240, 160)
         self.attach_preview.setMaximumSize(320, 220)
         self.attach_preview.setStyleSheet("border: 1px solid #ccc; background: #fafafa;")
+        self.attach_preview.clicked.connect(self.on_attachment_clicked)
 
         self.attach_name_lbl = QLabel("None")
         self.attach_name_lbl.setStyleSheet("color: #666;")
@@ -1700,6 +2361,52 @@ class GeneralJournalDetailDialog(QDialog):
         wrap.setLayout(container)
         wrap.setContentsMargins(0, 0, 0, 0)
         form.addRow("Attachment", wrap)
+
+    def _has_attachment(self) -> bool:
+        return (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
+
+    def _attachment_pixmap_full(self) -> Optional[QPixmap]:
+        if not self.attach_data or not self.attach_mime:
+            return None
+        if self.attach_mime in ("image/jpeg", "image/png"):
+            return pixmap_from_image_bytes(self.attach_data, QSize(0, 0))
+        return None
+
+    def _open_attachment_viewer(self):
+        pixmap = self._attachment_pixmap_full()
+        if not pixmap or pixmap.isNull():
+            QMessageBox.information(self, "Attachment", "Preview is not available for this file.")
+            return
+        dlg = AttachmentViewerDialog(pixmap, self.attach_name or "Attachment", self.attach_data, self.attach_name, self)
+        dlg.show()
+
+    def _download_attachment(self):
+        if not self.attach_data:
+            QMessageBox.warning(self, "Attachment", "Attachment data is missing.")
+            return
+        default = self.attach_name or "attachment"
+        if self.attach_mime == "application/pdf" and not default.lower().endswith(".pdf"):
+            default += ".pdf"
+        path, _ = QFileDialog.getSaveFileName(self, "Save attachment", default)
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(self.attach_data)
+            QMessageBox.information(self, "Saved", "Attachment saved.")
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+
+    def on_attachment_clicked(self):
+        if not self._has_attachment():
+            return
+        if not self.attach_data:
+            QMessageBox.warning(self, "Attachment", "Attachment is not loaded in memory.")
+            return
+        if self.attach_mime == "application/pdf":
+            self._download_attachment()
+        else:
+            self._open_attachment_viewer()
 
     def _show_note_field(self):
         if self.view_mode:
@@ -1748,7 +2455,7 @@ class GeneralJournalDetailDialog(QDialog):
 
     def _update_attachment_preview(self):
         max_size = QSize(300, 200)
-        has_attachment = (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
+        has_attachment = self._has_attachment()
         pixmap: Optional[QPixmap] = None
         if has_attachment and self.attach_data and self.attach_mime:
             if self.attach_mime in ("image/jpeg", "image/png"):
@@ -1764,10 +2471,22 @@ class GeneralJournalDetailDialog(QDialog):
                 self.attach_preview.setText("")
             else:
                 self.attach_preview.setPixmap(QPixmap())
-                self.attach_preview.setText("Preview not available")
+                msg = "Preview not available"
+                if self.attach_mime == "application/pdf":
+                    msg = "PDF attached - click to download"
+                self.attach_preview.setText(msg)
         else:
             self.attach_preview.setPixmap(QPixmap())
             self.attach_preview.setText("")
+
+        self.attach_preview.setCursor(Qt.PointingHandCursor if has_attachment else Qt.ArrowCursor)
+        if has_attachment:
+            if self.attach_mime == "application/pdf":
+                self.attach_preview.setToolTip("Click to download the PDF attachment")
+            else:
+                self.attach_preview.setToolTip("Click to view the attachment in a larger window")
+        else:
+            self.attach_preview.setToolTip("")
 
         name_text = self.attach_name if self.attach_name else "None"
         if self.attach_deleted:
@@ -1829,7 +2548,7 @@ class GeneralJournalDetailDialog(QDialog):
         self.table.setCellWidget(row, 1, dc)
 
         amt = QDoubleSpinBox()
-        amt.setRange(0, 10_000_000)
+        amt.setRange(-10_000_000, 10_000_000)
         amt.setDecimals(2)
         amt.setSingleStep(1.0)
         self.table.setCellWidget(row, 2, amt)
@@ -1842,7 +2561,7 @@ class GeneralJournalDetailDialog(QDialog):
         self.table.setCellWidget(row, 3, ccy)
 
         org = QDoubleSpinBox()
-        org.setRange(0, 10_000_000)
+        org.setRange(-10_000_000, 10_000_000)
         org.setDecimals(2)
         org.setSingleStep(1.0)
         self.table.setCellWidget(row, 4, org)
@@ -1930,16 +2649,16 @@ class GeneralJournalDetailDialog(QDialog):
                 raise ValueError("Invalid account selection")
 
             amt_dom = float(amt.value())
-            if amt_dom <= 0:
+            if abs(amt_dom) < 1e-9:
                 continue
 
             cur = ccy.currentText()
             if cur == self.dom:
-                amt_org = float(org.value()) if org.value() > 0 else amt_dom
+                amt_org = float(org.value()) if abs(org.value()) > 1e-9 else amt_dom
             else:
                 amt_org = float(org.value())
-                if amt_org <= 0:
-                    raise ValueError("Original amount is required for foreign currency lines")
+                if abs(amt_org) < 1e-9:
+                    raise ValueError("Original amount is required for foreign currency lines and cannot be zero")
 
             items.append({
                 "account_code": account_code,
@@ -1950,7 +2669,7 @@ class GeneralJournalDetailDialog(QDialog):
                 "item_text": note.text().strip() or None,
             })
         if not items:
-            raise ValueError("Add at least one line with amount > 0")
+            raise ValueError("Add at least one line with non-zero amount")
         return items
 
     def _save_attachment(self):
@@ -2213,11 +2932,38 @@ class InsightHome(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
 
         seg = QHBoxLayout()
-        self.btn_expense = QPushButton("Expense List")
-        self.btn_bs = QPushButton("Balance Sheet")
+        self.btn_expense = QPushButton("My Expenses")
+        self.btn_bs = QPushButton("My financial situation")
         self.btn_expense.setCheckable(True)
         self.btn_bs.setCheckable(True)
         self.btn_expense.setChecked(True)
+        self.btn_expense.setMinimumHeight(36)
+        self.btn_bs.setMinimumHeight(36)
+        self.btn_expense.setMinimumWidth(120)
+        self.btn_bs.setMinimumWidth(120)
+        segment_style = """
+            QPushButton {
+                background: #6e1d16;
+                color: #fef6e4;
+                border: 2px solid #6e1d16;
+                border-radius: 14px;
+                padding: 6px 14px;
+                font-weight: 600;
+            }
+            QPushButton:checked {
+                background: #f2c224;
+                color: #3b1c0f;
+                border-color: #e0ad1c;
+            }
+            QPushButton:hover:!checked {
+                background: #843024;
+            }
+            QPushButton:!checked {
+                opacity: 0.95;
+            }
+        """
+        self.btn_expense.setStyleSheet(segment_style)
+        self.btn_bs.setStyleSheet(segment_style)
         seg.addWidget(self.btn_expense)
         seg.addWidget(self.btn_bs)
         seg.addStretch(1)
@@ -2228,7 +2974,7 @@ class InsightHome(QWidget):
         self.back.setText("<")
         self.back.clicked.connect(self.go_back)
         self.back.setEnabled(False)
-        self.title = QLabel("Expense List")
+        self.title = QLabel("My Expenses")
         f = self.title.font()
         f.setPointSize(f.pointSize() + 2)
         f.setBold(True)
@@ -2264,7 +3010,7 @@ class InsightHome(QWidget):
         self.back.setEnabled(False)
         self.stack.setCurrentIndex(idx)
         self._set_segment_checked(idx)
-        self.title.setText("Expense List" if idx == 0 else "Balance Sheet")
+        self.title.setText("My Expenses" if idx == 0 else "My financial situation")
         self.refresh_current()
 
     def refresh_current(self):
@@ -2311,8 +3057,26 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.repo = repo
         self.importer = JsonExpenseImportService(repo)
+        self.prompt_builder = PromptBuilder(repo, os.path.join(os.path.dirname(__file__), "dev", "JSON Schema.json"))
+        self.busy_overlay = BusyOverlay(self)
+        self.ai_controller: Optional[AiImportController] = None
+        self.gemini_error: Optional[str] = None
+        try:
+            gemini_client = GeminiClient()
+            self.ai_controller = AiImportController(
+                repo=repo,
+                importer=self.importer,
+                prompt_builder=self.prompt_builder,
+                gemini_client=gemini_client,
+                overlay=self.busy_overlay,
+                open_entry=self.open_expense_entry,
+                refresh=self.refresh_all,
+                parent=self,
+            )
+        except Exception as e:
+            self.gemini_error = str(e)
         self.setWindowTitle("Debibi")
-        self.resize(430, 760)
+        self.resize(500, 820)
 
         menubar = QMenuBar(self)
         self.setMenuBar(menubar)
@@ -2340,12 +3104,50 @@ class MainWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.setTabPosition(QTabWidget.South)
+        tabs.setMinimumSize(480, 760)
+        tabs.setStyleSheet(
+            """
+            QTabWidget::pane {
+                border: none;
+                border-radius: 18px;
+                padding: 16px;
+                background: #f2e4c7;
+            }
+            QTabBar {
+                qproperty-drawBase: 0;
+            }
+            QTabBar::tab {
+                min-height: 44px;
+                min-width: 44px;
+                padding: 10px 22px;
+                margin: 0 6px;
+                color: #fef6e4;
+                background: #6e1d16;
+                border: 2px solid #6e1d16;
+                border-radius: 22px;
+                font-weight: 600;
+            }
+            QTabBar::tab:selected {
+                background: #f2c224;
+                color: #3b1c0f;
+                border-color: #e0ad1c;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #843024;
+            }
+            QTabBar::tab:!selected {
+                opacity: 0.95;
+            }
+            #TabContainer {
+                background: #f2e4c7;
+            }
+            """
+        )
 
         feed = QWidget()
         feed_l = QVBoxLayout(feed)
         feed_l.setContentsMargins(16, 16, 16, 16)
         feed_l.setSpacing(12)
-        feed_l.addStretch(1)
 
         feed_title = QLabel("Feed Debibi")
         feed_title.setAlignment(Qt.AlignCenter)
@@ -2354,15 +3156,30 @@ class MainWindow(QMainWindow):
         f_title.setBold(True)
         feed_title.setFont(f_title)
 
+        btn_camera = QPushButton("Feed Debibi with your camera")
+        btn_camera.setMinimumHeight(120)
+        btn_file = QPushButton("Feed Debibi image or file")
+        btn_file.setMinimumHeight(120)
+        btn_text = QPushButton("Feed Debibi any text")
+        btn_text.setMinimumHeight(120)
+
         btn_manual_expense = QPushButton("Record expenses manually")
-        btn_manual_expense.setMinimumHeight(120)
+        btn_manual_expense.setMinimumHeight(40)
         btn_manual_expense.clicked.connect(self.new_expense)
 
         btn_manual_advanced = QPushButton("Record other transactions manually")
         btn_manual_advanced.setMinimumHeight(40)
         btn_manual_advanced.clicked.connect(self.new_general)
 
+        btn_camera.clicked.connect(lambda: self._invoke_ai("camera"))
+        btn_file.clicked.connect(lambda: self._invoke_ai("file"))
+        btn_text.clicked.connect(lambda: self._invoke_ai("text"))
+
         feed_l.addWidget(feed_title)
+        feed_l.addSpacing(6)
+        feed_l.addWidget(btn_camera)
+        feed_l.addWidget(btn_file)
+        feed_l.addWidget(btn_text)
         feed_l.addSpacing(6)
         feed_l.addWidget(btn_manual_expense)
         feed_l.addWidget(btn_manual_advanced)
@@ -2381,7 +3198,13 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.insight, "Insight")
         tabs.setCurrentIndex(2)
 
-        self.setCentralWidget(tabs)
+        container = QWidget()
+        container.setObjectName("TabContainer")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(16, 16, 16, 16)
+        container_layout.setSpacing(12)
+        container_layout.addWidget(tabs)
+        self.setCentralWidget(container)
 
     def refresh_all(self):
         self.insight.refresh_all()
@@ -2395,6 +3218,26 @@ class MainWindow(QMainWindow):
         dlg = GeneralJournalDetailDialog(self.repo, entry_uuid=None, parent=self)
         if dlg.exec():
             self.refresh_all()
+
+    def open_expense_entry(self, entry_uuid: str, start_edit: bool = False):
+        dlg = ExpenseJournalDetailDialog(self.repo, entry_uuid=entry_uuid, parent=self, start_edit_mode=start_edit)
+        if dlg.exec():
+            self.refresh_all()
+
+    def _invoke_ai(self, mode: str):
+        if not self.ai_controller:
+            QMessageBox.critical(
+                self,
+                "Gemini not ready",
+                self.gemini_error or "Gemini client is not configured. Set GEMINI_API_KEY and restart.",
+            )
+            return
+        if mode == "camera":
+            self.ai_controller.import_from_camera()
+        elif mode == "file":
+            self.ai_controller.import_from_file()
+        elif mode == "text":
+            self.ai_controller.import_from_text()
 
     def import_json_entry(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2433,6 +3276,13 @@ def main():
     repo.seed_sample_data_if_empty()
 
     app = QApplication(sys.argv)
+    app.setStyleSheet(
+        """
+        QMainWindow, QDialog, QMessageBox {
+            background-color: #f2e4c7;
+        }
+        """
+    )
     w = MainWindow(repo)
     w.show()
     rc = app.exec()
