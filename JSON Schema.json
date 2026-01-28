@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/expense-entry.request.json",
+  "title": "Expense Entry Request (for LLM JSON-only output)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "date": {
+      "description": "Receipt/business date in YYYY-MM-DD. If unknown, output null (do not guess).",
+      "type": ["string", "null"],
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "store": {
+      "description": "Where the purchase was made (merchant/store name). If unknown, output null.",
+      "type": ["string", "null"],
+      "minLength": 0,
+      "maxLength": 200
+    },
+    "note": {
+      "description": "Short memo for uncertainties, parsing issues, or anything that did not fit other fields. Keep it concise. If nothing to note, output null.",
+      "type": ["string", "null"],
+      "minLength": 0,
+      "maxLength": 500
+    },
+    "payment_account": {
+      "description": "Choose exactly one payment method as an ASSET or LIAB account name from the provided list (e.g., Cash, Bank, Credit Card). Output the selected account name exactly as given in the enum placeholder.",
+      "type": "string",
+      "enum": "{PAYMENT_ACCOUNT_NAME_ENUM}",
+      "default": "Cash"
+    },
+    "currency_original": {
+      "description": "3-letter currency code found on the receipt (single currency per entry). If the receipt does not explicitly show a currency, use the default value as the assumed domestic currency. If you still cannot determine it, output null.",
+      "type": ["string", "null"],
+      "pattern": "^[A-Z]{3}$",
+      "default": "{USER_DOMESTIC_CURRENCY}"
+    },
+    "lines": {
+      "description": "Expense lines. Prefer aggregating by expense_category (one line per category with summed amounts). If per-item info is clearer, you may still emit multiple lines, but category-level subtotal is preferred.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expense_category": {
+            "description": "Choose exactly one expense category as an EXPENSE account name from the provided list. Output the selected account name exactly as given in the enum placeholder.",
+            "type": "string",
+            "enum": "{EXPENSE_ACCOUNT_NAME_ENUM}"
+          },
+          "note": {
+            "description": "Optional short memo for this receipt item line (e.g., item name, quantity, ambiguity, unreadable text). If nothing to note, output null.",
+            "type": ["string", "null"],
+            "minLength": 0,
+            "maxLength": 500
+          },
+          "amount_domestic": {
+            "description": "Domestic-currency amount for this receipt item line. Must be a non-zero number (positive or negative). Use negative values for discounts/coupons/savings only when needed to reconcile totals; if you add such a savings line, set expense_category to Other expenses. If the item sum already matches the receipt total, do not add a savings line. If the receipt currency equals domestic currency, set amount_domestic equal to amount_original.",
+            "type": "number",
+            "not": { "const": 0 }
+          },
+          "amount_original": {
+            "description": "Receipt/original-currency amount for this receipt item line. Must be a non-zero number (positive or negative). Use negative values for discounts/coupons/savings only when needed to reconcile totals; if you add such a savings line, set expense_category to Other expenses. If the item sum already matches the receipt total, do not add a savings line. If currency_original equals domestic currency, set amount_original equal to amount_domestic.",
+            "type": "number",
+            "not": { "const": 0 }
+          }
+        },
+        "required": ["expense_category", "amount_domestic", "amount_original"]
+      }
+    }
+  },
+  "required": ["payment_account", "lines"],
+  "examples": [
+    {
+      "date": "2026-01-25",
+      "store": "TESCO",
+      "note": "Receipt partially unreadable; some item names are in line notes.",
+      "payment_account": "Cash",
+      "currency_original": "{USER_DOMESTIC_CURRENCY}",
+      "lines": [
+        {
+          "expense_category": "Food and dining",
+          "note": "Milk 2L",
+          "amount_domestic": 2.15,
+          "amount_original": 2.15
+        },
+        {
+          "expense_category": "Clothing and personal care",
+          "note": "T-shirt",
+          "amount_domestic": 10,
+          "amount_original": 10
+        },
+          {
+          "expense_category": "Household supplies",
+          "note": "Laundry detergent",
+          "amount_domestic": 5.2,
+          "amount_original": 5.2
+        },
+        {
+          "expense_category": "Entertainment and leisure",
+          "note": "Magazine",
+          "amount_domestic": 5.2,
+          "amount_original": 5.2
+        }
+      ]
+    }
+  ]
+}

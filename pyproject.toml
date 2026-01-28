@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debibi"
+version = "0.1.0"
+description = "ADHD-friendly personal finance desktop prototype (PySide6 + SQLite + Gemini receipt ingestion)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+authors = [{name = "Debibi Team"}]
+dependencies = [
+  "PySide6",
+  "pypdfium2",
+  "pdf2image",
+  "Pillow",
+  "google-genai",
+  "python-dotenv",
+]
+
+[tool.setuptools]
+py-modules = ["debibi"]
+include-package-data = false

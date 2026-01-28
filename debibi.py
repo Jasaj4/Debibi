@@ -1,19 +1,6 @@
 
 """
-Debibi Accounting POC (SQLite + PySide6)
-
-Scope implemented:
-- Journal Item List Base (Card/Deck-ish list with date section headers)
-  - Used for Expense List and Account Transaction List
-- Balance Sheet Overview (Assets/Liabilities list with section headers)
-- Expense Journal Detail (simple expense entry input)
-- General Journal Detail (advanced journal input)
-- Balance Sheet Account Detail (manage user-managed ASSET/LIAB accounts)
-
-Notes:
-- UI hides account_code/entry_uuid/line_no/dc in list views as required.
-- DB schema and data format follow the provided design.
-- For simplicity, "sticky header" is represented as section header rows (not pinned).
+Debibi
 """
 
 from __future__ import annotations
@@ -1497,14 +1484,14 @@ class AiImportController(QObject):
             return
         text = dlg.get_text()
         if not text:
-            QMessageBox.warning(self.parent_widget, "Validation", "テキストを入力してください。")
+            QMessageBox.warning(self.parent_widget, "Validation", "Please enter text.")
             return
         self._start_worker(source="text", user_text=text)
 
     def import_from_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self.parent_widget,
-            "ファイルから取り込む",
+            "Import from file",
             "",
             "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
         )
@@ -2038,9 +2025,10 @@ class DebibiChatPage(QWidget):
         try:
             os.makedirs(self.log_dir, exist_ok=True)
             ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = os.path.join(self.log_dir, f"{ts}.json")
+            path = os.path.join(self.log_dir, f"{ts}.txt")
+            content = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2)
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.write(content)
         except Exception:
             # Swallow logging errors; don't block the UI
             pass
@@ -3885,7 +3873,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.repo = repo
         self.importer = JsonExpenseImportService(repo)
-        self.prompt_builder = PromptBuilder(repo, os.path.join(os.path.dirname(__file__), "dev", "JSON Schema.json"))
+        self.prompt_builder = PromptBuilder(repo, os.path.join(os.path.dirname(__file__), "JSON Schema.json"))
         self.busy_overlay = BusyOverlay(self)
         self.ai_controller: Optional[AiImportController] = None
         self.gemini_error: Optional[str] = None
@@ -3993,11 +3981,11 @@ class MainWindow(QMainWindow):
         btn_text = QPushButton("Feed Debibi any text")
         btn_text.setMinimumHeight(120)
 
-        btn_manual_expense = QPushButton("Record expenses manually")
+        btn_manual_expense = QPushButton("Input expenses manually")
         btn_manual_expense.setMinimumHeight(48)
         btn_manual_expense.clicked.connect(self.new_expense)
 
-        btn_manual_advanced = QPushButton("Record other transactions manually")
+        btn_manual_advanced = QPushButton("Input any other transactions manually (advanced)")
         btn_manual_advanced.setMinimumHeight(48)
         btn_manual_advanced.clicked.connect(self.new_general)
 

@@ -1,14 +1,27 @@
 # Debibi (Desktop Prototype)
 
-An ADHD-friendly personal finance prototype that turns expense tracking into a light, low-pressure experience. The current build focuses on a local, offline PySide6 desktop UI with a double-entry SQLite backbone. It now includes an AI “Feed Debibi” flow that sends receipts/text to Gemini and auto-creates expense entries.
+> **Status**: Desktop prototype / proof-of-concept  
+> **Audience**: Students, early-career adults, and developers exploring ADHD-friendly finance UX  
+> **Not production-ready**: No bank sync, no cloud, no encryption beyond SQLite defaults
 
+An ADHD-friendly personal finance prototype that turns expense tracking into a light, low-pressure experience. The current build focuses on a local, offline PySide6 desktop UI with a double-entry SQLite backbone. It now includes an AI “Feed Debibi” flow that sends receipts/text to Debibi and auto-creates expense entries.
 
 ## Overview (Background & Goal)
+
 - Motivation: student/young-adult debt stress and the difficulty ADHD users face with heavy finance apps. Debibi aims to lower friction, hide intimidating codes, and keep engagement gentle.
-- Approach: simple mobile-like desktop UI, receipts-as-feed metaphor, and emotionally neutral visuals. Data model follows trustworthy double-entry accounting so later insights stay consistent.
+- Approach: simple mobile-like desktop UI, receipts-as-feed metaphor, and emotionally neutral visuals.
+- Accounting core: ERP-style double-entry ledger (journal header + line items). This guarantees internal consistency (assets = liabilities + equity) and allows future features (cashflow, net worth, anomaly detection) without rework.
 - Scope for this prototype: manual journal entry, basic lists, balance overview, and user-managed asset/liability accounts. Everything runs locally; no network or bank links.
 
+### Design Principles (ADHD-friendly by design)
+
+- **Low activation energy**: minimal required fields, defaults everywhere
+- **Deferred correctness**: drafts first, accounting correctness enforced automatically
+- **No forced routines**: no daily reminders, streaks, or penalties
+- **Cognitive shielding**: account codes, debits/credits hidden unless needed
+
 ## How to Run
+
 Prerequisites: Python 3.10+ and pip.
 
 ```bash
@@ -16,11 +29,11 @@ Prerequisites: Python 3.10+ and pip.
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install --upgrade pip
-pip install PySide6 google-genai python-dotenv pypdfium2 pdf2image pillow
+pip install -e .
 
-# Set your Gemini key in .env (create if missing)
+# Set your Gemini AI key in .env (create if missing)
 echo "GEMINI_API_KEY=your-key-here" >> .env
-# Optional: override model
+# Optional: override model name
 echo "GEMINI_MODEL=gemini-2.5-flash" >> .env
 
 # Launch the app
@@ -28,53 +41,61 @@ python debibi.py
 ```
 
 Notes:
+
 - The app creates/uses a local `debibi.db` in the working directory. On first run it seeds sample accounts and a few example entries.
-- Everything is offline; quit the app to close the DB.
-- Gemini calls require network and a valid `GEMINI_API_KEY`. If missing, AI buttons show an error and fall back to manual entry.
+- All data is offline; quit the app to close the DB.
+- Debibi’s AI needs network access and a valid `GEMINI_API_KEY`. If it’s missing, AI buttons show an error and fall back to manual entry.
 
-## Main Features & Usage
-- Feed tab (AI + manual):
-  - **Feed Debibi with your camera**: capture or pick an image; sends to Gemini; creates an expense draft with the receipt attached.
-  - **Feed Debibi image or file**: pick JPG/PNG/PDF; Gemini parses to JSON schema, imports, and opens the draft.
-  - **Feed Debibi any text**: paste free text; Gemini structures it into an expense draft.
-  - **Record expenses manually** opens **Expense Journal Detail** (guided: categories + one payment account, auto-balances debit/credit).
-  - **Record other transactions manually** opens **General Journal Detail** (advanced free-form journal lines with balance check).
-- Debibi tab (chat):
-  - In-memory chat with Debibi using Gemini; no persistence (clears on exit or ❌ clear).
-  - Chat bubbles left/right aligned with avatar, single rounded border, auto-wrap, and auto-scroll; input bar with ↑ send.
-  - Context sent to LLM includes recent daily (30d) and monthly (6m) expense trends plus chat history (JSON roles).
-- Attachments: both journal dialogs support one attachment per entry (JPG/PNG/PDF up to 10MB). Use **Add / Replace** or **Remove**; images/PDFs show inline preview (PDF requires QtPdf).
-- Import from JSON (offline): use **Actions → Import JSON Entry** to load a JSON file that follows the schema in `dev/JSON Schema.json`; the importer creates an EXPENSE entry and opens it for review/edit before saving.
-- Insight tab: read-only drill-downs and charts.
-  - **My Expenses** (card list by date); tap to open **General Journal Detail** for the entry.
-  - **My Accounts** (assets/liabilities with section headers); tap an account to see **Account Transaction List**, then drill into an entry.
-  - **Expense Trend** stacked bars (per category) with date range and day/month granularity, legend toggles.
-  - **Assets Trend** net-assets line with optional assets/liabilities lines, date range, and day/month granularity.
-- Manage BS Accounts: add/rename/activate/deactivate user-managed asset/liability accounts (codes auto-generated).
-- JSON schema for AI ingestion: `dev/JSON Schema.json` defines the expected expense payload when an LLM/OCR front end is added.
+Sample `.env` file:
 
-## Importing Expenses via JSON (LLM/API hook)
-1) Generate a JSON payload that matches `dev/JSON Schema.json` (account names must match active accounts; defaults to domestic currency when omitted).
-2) In the app, go to **Actions → Import JSON Entry** and pick the file.
-3) The entry is created as EXPENSE and immediately opened in **General Journal Detail** so you can review/edit, attach a receipt, and save.
-
-Example payload:
-
-```json
-{
-  "date": "2026-01-25",
-  "store": "TESCO",
-  "note": "Parsed by OCR/LLM",
-  "payment_account": "Cash",
-  "currency_original": "GBP",
-  "lines": [
-    {"expense_category": "Food and dining", "note": "Milk", "amount_domestic": 2.15, "amount_original": 2.15},
-    {"expense_category": "Clothing and personal care", "note": "T-shirt", "amount_domestic": 10, "amount_original": 10}
-  ]
-}
+```dotenv
+GEMINI_API_KEY=XXXXXXXXXXXXXXXXXXXXXXX
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
+## Main Features & Usage
 
-## Development Status
-- Done: core schema creation and seeding; manual expense & general journal dialogs with validation and balance check; attachment storage + preview; JSON expense import; expense list + account transaction list cards; balance sheet overview; user-managed BS account maintenance; sample icons; domestic currency handling; basic navigation stack; **Gemini-powered Feed Debibi (camera/file/text → JSON → importer + attachment save)**; busy overlay and retry for LLM parsing; **Insight charts (Expense Trend stacked bars, Assets Trend net-assets line) with date range + day/month granularity, legend toggles, and optional assets/liabilities lines); Debibi chat tab (Gemini advice using recent expense trends, in-memory history, clear button, single-border bubbles).**
-- In progress / Not yet: avatar visuals/animation; gamified quests/XP/moods; further chart polish (theme alignment, saved filters); polished mobile visual language (fonts/colors), real sticky headers, settings UI, tests/CI; voice input; production-grade error copy and logging.
+All-in-one guide across the three tabs. Everything is saved locally, so you can reopen, edit, or delete later.
+
+### Feed (Capture without thinking)
+
+The fastest path from “I spent money” to a balanced journal entry.
+
+- **Feed Debibi automatically**
+  - Camera capture: one tap to snap a receipt. Debibi “chews” it and spits out an expense draft, with the image/PDF tucked in as proof.
+  - Pick image/file: hand Debibi a JPG/PNG/PDF (≤10 MB) and he drafts the expense for you, great for a e-receipts.
+  - Paste text: drop in the receipt words or your note; Debibi takes care of the remaining work.
+  - If Debibi is asleep/offline: he pops a gentle alert and you can keep going with manual entry.
+- **Manual entry**
+  - Expense Journal (simple): date, store, payment account, category/amount. Debits/credits balance automatically; supports one image/PDF attachment.
+  - General Journal (advanced): Designed for finance-savvy users; Take advantage of the full flexibility and reliability of double-entry bookkeeping. Record any type of transaction, including inter-account transfers, by selecting account and debit/credit entries per line, just like in an ERP system.
+
+### Debibi (Reflect, not judge)
+
+A conversational layer for lightweight reflection, not budgeting enforcement.
+
+- Ask questions about your money from Debibi, using your last 30 days (daily) and 6 months (monthly) expense trends as context.
+- Debibi only sees totals grouped by day/month (no raw line items), keeping the context lightweight and privacy-friendly.
+- “How are my spends this month?” works fine; prior turns are included in context.
+- Chat history lives in memory only. Clears on ❌ or app exit. If Debibi’s AI isn’t configured, you’re notified on send.
+
+### Insight (See structure, not noise)
+
+Traditional finance views built on the same ledger, surfaced only when you want them.
+
+- **My Expenses**: A list showing what I spent money on and how much; tap to open a journal entry for edit/delete.
+- **My Accounts**: A list showing how much money I have in each account and where I have debts or credit card balances; tap an account → its transactions → the entry. Use the ⚙️ to add/rename/deactivate accounts.
+- **Expense Trend**: stacked bars by category; set From/To and switch day/month granularity; toggle categories via legend.
+- **Assets Trend**: net-assets line; optionally show assets and liabilities lines via checkboxes; same date/granularity filters.
+
+### JSON & debugging
+
+- Direct JSON import: Actions Menu → Import JSON Entry to load a file matching `JSON Schema.json`; opens an expense draft for review/edit.
+- When Debibi can’t digest a “snack” (JSON parse/validation fails), the raw payload is saved to `log/yyyymmdd_hhmmss_xxx.json` so you can inspect and try again later.
+
+## Tech Rationale
+
+- **PySide6**: native desktop feel and flexible custom UI without web stack overhead
+- **SQLite**: transparent, inspectable, zero-setup ledger storage
+- **Local-first**: predictable behavior, no auth, no background sync
+- **LLM as assistant, not authority**: AI drafts entries; users always review
