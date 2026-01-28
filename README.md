@@ -1,13 +1,4 @@
 # Debibi (Desktop Prototype)
-> **Concept credit**  
-> The original product concept of Debibi was developed collaboratively with
-> Chit Hei Ng, Xilai Wang, and Junwen Huang for the Gillmore Hackathon 2025,
-> where the idea was awarded **1st place**.  
->  
-> This repository contains a **fully independent, individual implementation**
-> created specifically for the MISDI Individual Programming Assignment.
-> All code, system design, and AI-assisted development documented here were
-> produced solely by the author after the hackathon.
 
 > **Status**: Local-first desktop prototype (proof of concept).
 > This build intentionally excludes bank/credit-card sync, budgeting or debt advice,
@@ -114,3 +105,13 @@ Traditional finance views built on the same ledger, surfaced only when you want 
 - **SQLite**: transparent, inspectable, zero-setup ledger storage
 - **Local-first**: predictable behavior, no auth, no background sync
 - **LLM as assistant, not authority**: AI drafts entries; users always review
+
+> **Concept credit**  
+> The original product concept of Debibi was developed collaboratively with
+> Chit Hei Ng, Xilai Wang, and Junwen Huang for the Gillmore Hackathon 2025,
+> where the idea was awarded **1st place**.  
+>  
+> This repository contains a **fully independent, individual implementation**
+> created specifically for the MISDI Individual Programming Assignment.
+> All code, system design, and AI-assisted development documented here were
+> produced solely by the author after the hackathon.
