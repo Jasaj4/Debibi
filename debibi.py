@@ -28,6 +28,7 @@ import sys
 import tempfile
 import uuid
 import warnings
+import shiboken6
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -37,7 +38,7 @@ from google import genai
 from google.genai import types as genai_types
 from pdf2image import convert_from_bytes
 from PIL import Image
-from PySide6.QtCore import QBuffer, QByteArray, QDate, QIODevice, QPointF, QRectF, QSize, QSizeF, Qt, Signal, QThread, QObject
+from PySide6.QtCore import QBuffer, QByteArray, QDate, QIODevice, QPointF, QRectF, QSize, QSizeF, Qt, Signal, QThread, QObject, QTimer, QEvent
 from PySide6.QtGui import QAction, QFont, QImage, QPainter, QPixmap, QColor, QIcon, QPen
 from PySide6.QtMultimedia import QCamera, QImageCapture, QMediaCaptureSession, QMediaDevices
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -79,9 +80,9 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QToolButton,
+    QHBoxLayout,
     QVBoxLayout,
     QWidget,
-    QHBoxLayout,
     QFrame,
 )
 
@@ -1246,6 +1247,45 @@ class GeminiClient:
             except Exception as e2:
                 raise GeminiClientError(f"Failed to parse JSON from Gemini. Raw response:\n{retry_text}") from e2
 
+    def generate_text(
+        self,
+        system_prompt: str,
+        user_text: str,
+        temperature: float = 0.4,
+        max_output_tokens: int = 512,
+    ) -> str:
+        if not user_text:
+            raise GeminiClientError("user_text must not be empty.")
+
+        def _call() -> str:
+            config = genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
+            resp = self.client.models.generate_content(
+                model=self.model,
+                contents=[user_text],
+                config=config,
+            )
+            text = getattr(resp, "text", None)
+            if not text and hasattr(resp, "candidates"):
+                for cand in resp.candidates:
+                    parts = getattr(cand, "content", None)
+                    if not parts:
+                        continue
+                    for p in getattr(parts, "parts", []):
+                        if hasattr(p, "text"):
+                            text = p.text
+                            break
+                    if text:
+                        break
+            if not text:
+                raise GeminiClientError("Gemini returned empty response.")
+            return text.strip()
+
+        return _call()
+
 
 class GeminiWorker(QObject):
     finished = Signal(object)
@@ -1584,6 +1624,414 @@ class AiImportController(QObject):
         finally:
             self.overlay.hide_overlay()
             self._cleanup_thread()
+
+
+# -------------------------
+# Debibi Chat helpers
+# -------------------------
+
+
+class ExpenseTrendFormatter:
+    """Formats expense trend strings for LLM prompt."""
+
+    @staticmethod
+    def _format_amount(amt: float, ccy: str) -> Optional[str]:
+        if abs(amt) < 0.005:
+            return None
+        sign = "-" if amt < 0 else ""
+        return f"{sign}{ccy} {abs(amt):,.2f}"
+
+    @staticmethod
+    def build_daily_string(repo: "Repo") -> str:
+        today = dt.date.today()
+        start = today - dt.timedelta(days=29)
+        rows = repo.list_expense_trend(granularity="day", date_from=start.isoformat(), date_to=today.isoformat())
+        dom = repo.get_domestic_currency() or "GBP"
+        per_day: Dict[str, List[Tuple[str, float]]] = {}
+        for r in rows:
+            per_day.setdefault(r["label"], []).append((r["account_name"], float(r["amount_domestic_sum"])))
+
+        lines: List[str] = []
+        cur = start
+        while cur <= today:
+            key = cur.isoformat()
+            items = per_day.get(key, [])
+            parts = []
+            for name, amt in items:
+                fmt = ExpenseTrendFormatter._format_amount(amt, dom)
+                if fmt:
+                    parts.append(f"{name}: {fmt}")
+            if parts:
+                lines.append(f"{key}, " + ", ".join(parts) + ".")
+            else:
+                lines.append(f"{key} No Expenses.")
+            cur += dt.timedelta(days=1)
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def build_monthly_string(repo: "Repo") -> str:
+        def _add_months(d: dt.date, months: int) -> dt.date:
+            y = d.year + (d.month - 1 + months) // 12
+            m = (d.month - 1 + months) % 12 + 1
+            return dt.date(y, m, 1)
+
+        today_first = dt.date.today().replace(day=1)
+        start_month = _add_months(today_first, -5)
+        months = [_add_months(start_month, i) for i in range(6)]
+        end = _add_months(start_month, 6) - dt.timedelta(days=1)
+
+        rows = repo.list_expense_trend(granularity="month", date_from=start_month.isoformat(), date_to=end.isoformat())
+        dom = repo.get_domestic_currency() or "GBP"
+        per_month: Dict[str, List[Tuple[str, float]]] = {}
+        for r in rows:
+            per_month.setdefault(r["label"], []).append((r["account_name"], float(r["amount_domestic_sum"])))
+
+        lines: List[str] = []
+        for m0 in months:
+            key = f"{m0.year:04d}-{m0.month:02d}"
+            disp = m0.strftime("%B %Y")
+            items = per_month.get(key, [])
+            parts = []
+            for name, amt in items:
+                fmt = ExpenseTrendFormatter._format_amount(amt, dom)
+                if fmt:
+                    parts.append(f"{name}: {fmt}")
+            if parts:
+                lines.append(f"{disp}, " + ", ".join(parts) + ".")
+            else:
+                lines.append(f"{disp} No Expenses")
+        return "\n".join(lines) + "\n"
+
+
+class DebibiChatWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, client: GeminiClient, system_prompt: str, user_payload: str):
+        super().__init__()
+        self.client = client
+        self.system_prompt = system_prompt
+        self.user_payload = user_payload
+
+    def run(self):
+        try:
+            text = self.client.generate_text(self.system_prompt, self.user_payload, temperature=0.4, max_output_tokens=512)
+            self.finished.emit(text)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class DebibiChatPage(QWidget):
+    """Simple in-memory Debibi advice chat."""
+
+    def __init__(self, repo: Repo, gemini_client: Optional[GeminiClient], parent=None):
+        super().__init__(parent)
+        self.repo = repo
+        self.gemini_client = gemini_client
+        self.chat_history: List[Dict[str, Any]] = []
+        self.pending = False
+        self.typing_widget: Optional[QWidget] = None
+        self._threads: List[QThread] = []
+        self._bubble_widgets: List[QFrame] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        # Header
+        header = QHBoxLayout()
+        title = QLabel("Debibi chat")
+        tf = title.font()
+        tf.setBold(True)
+        tf.setPointSize(tf.pointSize() + 2)
+        title.setFont(tf)
+        header.addWidget(title)
+        header.addStretch(1)
+        self.btn_clear = QToolButton()
+        self.btn_clear.setText("❌")
+        self.btn_clear.setCursor(Qt.PointingHandCursor)
+        self.btn_clear.setToolTip("Clear chat")
+        self.btn_clear.setStyleSheet("QToolButton { border: none; font-size: 16px; padding: 6px; } QToolButton:hover { background: rgba(0,0,0,0.06); border-radius: 10px; }")
+        self.btn_clear.clicked.connect(self.clear_chat)
+        header.addWidget(self.btn_clear)
+        root.addLayout(header)
+
+        # Chat log
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.viewport().installEventFilter(self)
+        self.log_container = QWidget()
+        # Background pixmap for placeholder
+        self._bg_label = QLabel(self.log_container)
+        self._bg_label.setScaledContents(False)
+        self._bg_label.setAlignment(Qt.AlignCenter)
+        self._bg_label.setStyleSheet("background: transparent;")
+        self.log_container.setStyleSheet("background: transparent;")
+        self.log_layout = QVBoxLayout(self.log_container)
+        self.log_layout.setAlignment(Qt.AlignTop)
+        self.log_layout.setSpacing(10)
+        self.placeholder = QLabel("Ask anything about your money")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setStyleSheet("color: #888; padding: 16px;")
+        self.log_layout.addWidget(self.placeholder)
+        self.scroll.setWidget(self.log_container)
+        root.addWidget(self.scroll, 1)
+
+        # Input bar
+        input_row = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Message Debibi…")
+        self.input.returnPressed.connect(self._send)
+        self.btn_send = QToolButton()
+        self.btn_send.setText("↑")
+        self.btn_send.setCursor(Qt.PointingHandCursor)
+        self.btn_send.setEnabled(True)
+        self.btn_send.setStyleSheet(
+            """
+            QToolButton {
+                background: #6e1d16;
+                color: #fef6e4;
+                border: 2px solid #6e1d16;
+                border-radius: 14px;
+                padding: 10px 14px;
+                font-weight: 700;
+                font-size: 14px;
+            }
+            QToolButton:disabled {
+                background: #c7b9a2;
+                border-color: #c7b9a2;
+                color: #f0e9dc;
+            }
+            QToolButton:hover:!disabled { background: #843024; }
+            QToolButton:pressed:!disabled { background: #f2c224; color: #3b1c0f; border-color: #e0ad1c; }
+            """
+        )
+        self.btn_send.clicked.connect(self._send)
+        input_row.addWidget(self.input, 1)
+        input_row.addWidget(self.btn_send)
+        root.addLayout(input_row)
+
+        self.setStyleSheet(
+            """
+            DebibiChatPage {
+                background: #f2e4c7;
+            }
+            QScrollArea {
+                border: none;
+                background: transparent;
+                border-radius: 14px;
+            }
+            """
+        )
+
+    # UI helpers -----------------------------------------------------
+    def _add_message(self, speaker: str, text: str, is_typing: bool = False) -> QWidget:
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setSpacing(8)
+        h.setContentsMargins(4, 0, 4, 0)
+
+        bubble = QFrame()
+        bubble.setObjectName("chatBubble")
+        bubble.setFrameShape(QFrame.NoFrame)
+        bubble.setStyleSheet(
+            f"""
+            QFrame#chatBubble {{
+                background: {'#fdf5e6' if speaker=='debibi' else '#f3f3f3'};
+                border: 1px solid #cfcfcf;
+                border-radius: 14px;
+                padding: 12px;
+            }}
+            """
+        )
+        bubble.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        bubble.setMaximumWidth(self._bubble_width())
+        bubble_layout = QVBoxLayout(bubble)
+        bubble_layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(text if not is_typing else "…")
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        label.setStyleSheet("border: none; background: transparent;")
+        bubble_layout.addWidget(label)
+
+        if speaker == "debibi":
+            icon_lbl = QLabel()
+            pix = QPixmap(os.path.join("assets", "debibi_profile_photo.png"))
+            if not pix.isNull():
+                pix = pix.scaled(40, 40, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                icon_lbl.setPixmap(pix)
+            icon_lbl.setFixedSize(42, 42)
+            h.addWidget(icon_lbl, 0, Qt.AlignTop)
+            h.addWidget(bubble, 0, Qt.AlignLeft)
+            h.addStretch(1)
+        else:
+            h.addStretch(1)
+            h.addWidget(bubble, 0, Qt.AlignRight)
+
+        self.log_layout.addWidget(container)
+        self._bubble_widgets.append(bubble)
+        self._scroll_to_bottom()
+        return container
+
+    def _scroll_to_bottom(self):
+        QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().maximum()))
+
+    # State/actions ---------------------------------------------------
+    def clear_chat(self):
+        self.chat_history.clear()
+        self.pending = False
+        self.typing_widget = None
+        self._bubble_widgets.clear()
+        while self.log_layout.count():
+            item = self.log_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        if self.placeholder is None:
+            self.placeholder = QLabel("Ask anything about your money")
+            self.placeholder.setAlignment(Qt.AlignCenter)
+            self.placeholder.setStyleSheet("color: #888; padding: 16px;")
+        self.log_layout.addWidget(self.placeholder)
+        self.input.clear()
+        self.btn_send.setEnabled(True)
+
+    def _send(self):
+        text = self.input.text().strip()
+        if not text:
+            return
+        if self.pending:
+            QMessageBox.information(self, "Busy", "Wait for Debibi to reply.")
+            return
+        if not self.gemini_client:
+            QMessageBox.critical(self, "Gemini not ready", "Gemini client is not configured. Set GEMINI_API_KEY and restart.")
+            return
+
+        # remove placeholder
+        self._remove_placeholder()
+
+        self.chat_history.append({"speaker": "user", "text": text, "ts": now_iso()})
+        self._add_message("user", text)
+        self.input.clear()
+        self.pending = True
+        self.btn_send.setEnabled(False)
+
+        self.typing_widget = self._add_message("debibi", "…", is_typing=True)
+
+        system_prompt = self._build_system_prompt()
+        user_payload = self._build_user_payload(text)
+
+        worker = DebibiChatWorker(self.gemini_client, system_prompt, user_payload)
+        thread = QThread()
+        worker.moveToThread(thread)
+        worker.finished.connect(self._on_reply, Qt.QueuedConnection)
+        worker.failed.connect(self._on_error, Qt.QueuedConnection)
+        thread.started.connect(worker.run)
+        thread.start()
+        self._threads.append(thread)
+
+        def cleanup():
+            worker.deleteLater()
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+            if thread in self._threads:
+                self._threads.remove(thread)
+
+        worker.finished.connect(cleanup, Qt.QueuedConnection)
+        worker.failed.connect(cleanup, Qt.QueuedConnection)
+
+    def _remove_placeholder(self):
+        for i in range(self.log_layout.count()):
+            item = self.log_layout.itemAt(i)
+            w = item.widget() if item else None
+            if w is self.placeholder:
+                self.log_layout.takeAt(i)
+                self.placeholder.setParent(None)
+                self.placeholder.deleteLater()
+                self.placeholder = None
+                break
+
+    def _bubble_width(self) -> int:
+        return max(200, int(self.scroll.viewport().width() * 0.8))
+
+    def eventFilter(self, obj, event):
+        if obj is self.scroll.viewport() and event.type() == QEvent.Resize:
+            width = self._bubble_width()
+            self._bubble_widgets = [b for b in self._bubble_widgets if b and shiboken6.isValid(b)]
+            for b in self._bubble_widgets:
+                b.setMaximumWidth(width)
+            self._scroll_to_bottom()
+            self._resize_bg()
+        return super().eventFilter(obj, event)
+
+    def _build_system_prompt(self) -> str:
+        daily = ExpenseTrendFormatter.build_daily_string(self.repo)
+        monthly = ExpenseTrendFormatter.build_monthly_string(self.repo)
+        return (
+            "You are Debibi, a personal financial expert. Answer concisely in human language (2-4 sentences) with supportive, practical advice.\n"
+            "Use the provided domestic currency labels.\n"
+            "Recent daily expenses (last 30 days):\n"
+            f"{daily}"
+            "Recent monthly expenses (last 6 months):\n"
+            f"{monthly}"
+        )
+
+    def _build_user_payload(self, latest_question: str) -> str:
+        payload = {
+            "chat_history": [{"speaker": m["speaker"], "text": m["text"]} for m in self.chat_history],
+            "latest_user_question": latest_question,
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _on_reply(self, text: str):
+        if not self.pending and not self.chat_history:
+            return  # cleared while waiting
+        if self.typing_widget:
+            tw = self.typing_widget
+            tw.deleteLater()
+            self.typing_widget = None
+            self._bubble_widgets = [b for b in self._bubble_widgets if b and shiboken6.isValid(b) and b is not tw]
+        self._add_message("debibi", text)
+        self.chat_history.append({"speaker": "debibi", "text": text, "ts": now_iso()})
+        self.pending = False
+        self.btn_send.setEnabled(True)
+
+    def _on_error(self, message: str):
+        if not self.pending and not self.chat_history:
+            return
+        if self.typing_widget:
+            tw = self.typing_widget
+            tw.deleteLater()
+            self.typing_widget = None
+            self._bubble_widgets = [b for b in self._bubble_widgets if b and shiboken6.isValid(b) and b is not tw]
+        self._add_message("debibi", "Sorry, I couldn't reach Gemini. Please try again.")
+        self.pending = False
+        self.btn_send.setEnabled(True)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_bg()
+
+    def _resize_bg(self):
+        if not hasattr(self, "_bg_label") or not shiboken6.isValid(self._bg_label):
+            return
+        pix = QPixmap(os.path.join("assets", "debibi_avatar.png"))
+        if pix.isNull():
+            self._bg_label.hide()
+            return
+        vw = self.scroll.viewport().width()
+        vh = self.scroll.viewport().height()
+        if vw <= 0 or vh <= 0:
+            return
+        target_w = int(vw * 0.8)
+        target_h = int(vh * 0.8)
+        pix = pix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._bg_label.setPixmap(pix)
+        self._bg_label.resize(self.log_container.size())
+        self._bg_label.lower()
+        self._bg_label.show()
 
     def _save_failed_payload(self, payload: Any):
         """Persist LLM payload for debugging when import fails."""
@@ -3441,8 +3889,10 @@ class MainWindow(QMainWindow):
         self.busy_overlay = BusyOverlay(self)
         self.ai_controller: Optional[AiImportController] = None
         self.gemini_error: Optional[str] = None
+        self.gemini_client: Optional[GeminiClient] = None
         try:
             gemini_client = GeminiClient()
+            self.gemini_client = gemini_client
             self.ai_controller = AiImportController(
                 repo=repo,
                 importer=self.importer,
@@ -3587,16 +4037,12 @@ class MainWindow(QMainWindow):
         feed_l.addWidget(btn_manual_advanced)
         feed_l.addStretch(1)
 
-        debibi = QWidget()
-        debibi_l = QVBoxLayout(debibi)
-        debibi_l.addStretch(1)
-        debibi_l.addWidget(QLabel("Debibi (not implemented yet)"), alignment=Qt.AlignCenter)
-        debibi_l.addStretch(1)
+        self.debibi_chat = DebibiChatPage(repo, self.gemini_client)
 
         self.insight = InsightHome(repo)
 
         tabs.addTab(feed, "Feed")
-        tabs.addTab(debibi, "Debibi")
+        tabs.addTab(self.debibi_chat, "Debibi")
         tabs.addTab(self.insight, "Insight")
         tabs.setCurrentIndex(1)
 

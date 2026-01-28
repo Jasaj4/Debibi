@@ -39,6 +39,10 @@ Notes:
   - **Feed Debibi any text**: paste free text; Gemini structures it into an expense draft.
   - **Record expenses manually** opens **Expense Journal Detail** (guided: categories + one payment account, auto-balances debit/credit).
   - **Record other transactions manually** opens **General Journal Detail** (advanced free-form journal lines with balance check).
+- Debibi tab (chat):
+  - In-memory chat with Debibi using Gemini; no persistence (clears on exit or ❌ clear).
+  - Chat bubbles left/right aligned with avatar, single rounded border, auto-wrap, and auto-scroll; input bar with ↑ send.
+  - Context sent to LLM includes recent daily (30d) and monthly (6m) expense trends plus chat history (JSON roles).
 - Attachments: both journal dialogs support one attachment per entry (JPG/PNG/PDF up to 10MB). Use **Add / Replace** or **Remove**; images/PDFs show inline preview (PDF requires QtPdf).
 - Import from JSON (offline): use **Actions → Import JSON Entry** to load a JSON file that follows the schema in `dev/JSON Schema.json`; the importer creates an EXPENSE entry and opens it for review/edit before saving.
 - Insight tab: read-only drill-downs and charts.
@@ -47,7 +51,6 @@ Notes:
   - **Expense Trend** stacked bars (per category) with date range and day/month granularity, legend toggles.
   - **Assets Trend** net-assets line with optional assets/liabilities lines, date range, and day/month granularity.
 - Manage BS Accounts: add/rename/activate/deactivate user-managed asset/liability accounts (codes auto-generated).
-- Debibi tab: placeholder for future avatar/chat.
 - JSON schema for AI ingestion: `dev/JSON Schema.json` defines the expected expense payload when an LLM/OCR front end is added.
 
 ## Importing Expenses via JSON (LLM/API hook)
@@ -73,5 +76,5 @@ Example payload:
 
 
 ## Development Status
-- Done: core schema creation and seeding; manual expense & general journal dialogs with validation and balance check; attachment storage + preview; JSON expense import; expense list + account transaction list cards; balance sheet overview; user-managed BS account maintenance; sample icons; domestic currency handling; basic navigation stack; **Gemini-powered Feed Debibi (camera/file/text → JSON → importer + attachment save)**; busy overlay and retry for LLM parsing; **Insight charts (Expense Trend stacked bars, Assets Trend net-assets line) with date range + day/month granularity, legend toggles, and optional assets/liabilities lines.**
-- In progress / Not yet: Debibi avatar + chat; gamified quests/XP/moods; further chart polish (theme alignment, saved filters); polished mobile visual language (fonts/colors), real sticky headers, settings UI, tests/CI; voice input; production-grade error copy and logging.
+- Done: core schema creation and seeding; manual expense & general journal dialogs with validation and balance check; attachment storage + preview; JSON expense import; expense list + account transaction list cards; balance sheet overview; user-managed BS account maintenance; sample icons; domestic currency handling; basic navigation stack; **Gemini-powered Feed Debibi (camera/file/text → JSON → importer + attachment save)**; busy overlay and retry for LLM parsing; **Insight charts (Expense Trend stacked bars, Assets Trend net-assets line) with date range + day/month granularity, legend toggles, and optional assets/liabilities lines); Debibi chat tab (Gemini advice using recent expense trends, in-memory history, clear button, single-border bubbles).**
+- In progress / Not yet: avatar visuals/animation; gamified quests/XP/moods; further chart polish (theme alignment, saved filters); polished mobile visual language (fonts/colors), real sticky headers, settings UI, tests/CI; voice input; production-grade error copy and logging.
