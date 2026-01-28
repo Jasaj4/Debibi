@@ -3974,9 +3974,9 @@ class MainWindow(QMainWindow):
         f_title.setBold(True)
         feed_title.setFont(f_title)
 
-        btn_camera = QPushButton("Feed Debibi with your camera")
+        btn_camera = QPushButton("Feed Debibi receipt with your camera")
         btn_camera.setMinimumHeight(120)
-        btn_file = QPushButton("Feed Debibi image or file")
+        btn_file = QPushButton("Feed Debibi receipt image or file")
         btn_file.setMinimumHeight(120)
         btn_text = QPushButton("Feed Debibi any text")
         btn_text.setMinimumHeight(120)
@@ -3985,7 +3985,7 @@ class MainWindow(QMainWindow):
         btn_manual_expense.setMinimumHeight(48)
         btn_manual_expense.clicked.connect(self.new_expense)
 
-        btn_manual_advanced = QPushButton("Input any other transactions manually (advanced)")
+        btn_manual_advanced = QPushButton("Input any transactions manually (advanced)")
         btn_manual_advanced.setMinimumHeight(48)
         btn_manual_advanced.clicked.connect(self.new_general)
 
