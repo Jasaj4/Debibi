@@ -1,8 +1,9 @@
 # Debibi (Desktop Prototype)
 
-> **Status**: Desktop prototype / proof-of-concept  
-> **Audience**: Students, early-career adults, and developers exploring ADHD-friendly finance UX  
-> **Not production-ready**: No bank sync, no cloud, no encryption beyond SQLite defaults
+> **Status**: Local-first desktop prototype (proof of concept).
+> This build intentionally excludes bank/credit-card sync, budgeting or debt advice,
+> server/cloud infrastructure, mobile or production-grade web UI, and character/gamification systems.
+> The focus is on validating the core ledger model, AI-assisted input flow and AI chat-bot.
 
 An ADHD-friendly personal finance prototype that turns expense tracking into a light, low-pressure experience. The current build focuses on a local, offline PySide6 desktop UI with a double-entry SQLite backbone. It now includes an AI “Feed Debibi” flow that sends receipts/text to Debibi and auto-creates expense entries.
 
