@@ -28,7 +28,12 @@ Prerequisites: Python 3.10+ and pip.
 ```bash
 # From the repo root
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+
+source .venv/bin/activate
+
+# if you are on Windows: 
+# .venv\Scripts\Activate
+
 pip install --upgrade pip
 pip install -e .
 
