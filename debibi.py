@@ -70,7 +70,9 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QScroller,
     QStackedWidget,
     QTabWidget,
     QTableWidget,
@@ -80,6 +82,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QHBoxLayout,
+    QFrame,
 )
 
 CAMERA_AVAILABLE = True
@@ -488,7 +491,9 @@ class Repo:
                        FROM gl_account
                       WHERE is_user_managed=1
                         AND account_type IN ('ASSET','LIAB')
-                   ORDER BY account_type, account_name"""
+                   ORDER BY
+                     CASE WHEN is_active=0 THEN 3 WHEN account_type='ASSET' THEN 1 ELSE 2 END,
+                     account_name"""
             ).fetchall()
         )
 
@@ -1719,6 +1724,278 @@ class AttachmentViewerDialog(QDialog):
             QMessageBox.critical(self, "Save failed", str(e))
 
 
+# -------------------------
+# Reusable header components
+# -------------------------
+
+
+class NoteFieldSection(QObject):
+    """Shared note field with lazy reveal behaviour used by journal dialogs."""
+
+    def __init__(self, owner: QWidget):
+        super().__init__(owner)
+        self.owner = owner
+        self.note = QTextEdit()
+        self.note.setFixedHeight(70)
+        self.add_btn = QPushButton("Add note")
+        self.add_btn.clicked.connect(self._show_note_field)
+        self.note_shown_with_empty = False
+        self._view_mode = False
+        self.note.textChanged.connect(self.update_visibility)
+        self.update_visibility()
+
+    def wrap_widget(self) -> QWidget:
+        lay = QVBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.note)
+        lay.addWidget(self.add_btn, alignment=Qt.AlignLeft)
+        widget = QWidget()
+        widget.setLayout(lay)
+        return widget
+
+    def _show_note_field(self):
+        if self._view_mode:
+            return
+        self.note_shown_with_empty = True
+        self.update_visibility()
+        self.note.setFocus()
+
+    def update_visibility(self):
+        has_text = bool(self.note.toPlainText().strip())
+        if has_text:
+            self.note_shown_with_empty = False
+        show_note = has_text or self.note_shown_with_empty
+        self.note.setVisible(show_note)
+        self.add_btn.setVisible(not show_note)
+
+    def set_view_mode(self, view_mode: bool):
+        self._view_mode = view_mode
+        self.note.setEnabled(not view_mode)
+        self.add_btn.setEnabled(not view_mode)
+        if view_mode:
+            self.note_shown_with_empty = False
+        self.update_visibility()
+
+    def set_edit_mode(self):
+        self.set_view_mode(False)
+
+    def set_text(self, text: str):
+        self.note.setPlainText(text or "")
+        self.update_visibility()
+
+    def text(self) -> str:
+        return self.note.toPlainText()
+
+
+class AttachmentSection(QObject):
+    """Shared attachment picker/preview used by journal dialogs."""
+
+    def __init__(self, owner: QWidget, form: QFormLayout, label: str = "Attachment"):
+        super().__init__(owner)
+        self.owner = owner
+        self.attach_data: Optional[bytes] = None
+        self.attach_mime: Optional[str] = None
+        self.attach_name: Optional[str] = None
+        self.attach_deleted: bool = False
+        self.attach_existing_present: bool = False
+        self.view_mode: bool = False
+
+        self.preview = ClickableLabel("No attachment")
+        self.preview.setAlignment(Qt.AlignLeft)
+        self.preview.setMinimumSize(240, 160)
+        self.preview.setMaximumSize(320, 220)
+        self.preview.setStyleSheet("border: 1px solid #ccc; background: #fafafa;")
+        self.preview.clicked.connect(self.on_attachment_clicked)
+
+        self.name_lbl = QLabel("None")
+        self.name_lbl.setStyleSheet("color: #666;")
+
+        self.add_btn = QPushButton("Add / Replace")
+        self.remove_btn = QPushButton("Remove")
+        for btn in (self.add_btn, self.remove_btn):
+            btn.setStyleSheet("margin: 0; padding: 5px;")
+        self.add_btn.clicked.connect(self.on_select_attachment)
+        self.remove_btn.clicked.connect(self.on_remove_attachment)
+
+        btns = QHBoxLayout()
+        btns.addWidget(self.add_btn)
+        btns.addWidget(self.remove_btn)
+        btns.addStretch(1)
+
+        container = QVBoxLayout()
+        container.setContentsMargins(0, 0, 0, 0)
+        container.addWidget(self.preview)
+        container.addWidget(self.name_lbl)
+        container.addLayout(btns)
+
+        wrap = QWidget()
+        wrap.setLayout(container)
+        wrap.setContentsMargins(0, 0, 0, 0)
+        form.addRow(label, wrap)
+
+        self.update_preview()
+
+    # --- state helpers
+    def has_attachment(self) -> bool:
+        return (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
+
+    def set_view_mode(self, view_mode: bool):
+        self.view_mode = view_mode
+        self.add_btn.setEnabled(not view_mode)
+        self.update_preview()
+
+    def load_existing(self, att_row: Optional[sqlite3.Row]):
+        if att_row:
+            self.attach_data = att_row["file_blob"]
+            self.attach_mime = att_row["mime_type"]
+            self.attach_name = att_row["file_name"]
+            self.attach_deleted = False
+            self.attach_existing_present = True
+        else:
+            self.attach_data = None
+            self.attach_mime = None
+            self.attach_name = None
+            self.attach_deleted = False
+            self.attach_existing_present = False
+        self.update_preview()
+
+    def save(self, repo: Repo, entry_uuid: Optional[str]):
+        if not entry_uuid:
+            return
+        if self.attach_data and self.attach_mime:
+            repo.upsert_attachment(entry_uuid, self.attach_name, self.attach_mime, self.attach_data)
+            self.attach_existing_present = True
+            self.attach_deleted = False
+        elif self.attach_deleted or self.attach_existing_present:
+            repo.delete_attachment(entry_uuid)
+            self.attach_existing_present = False
+
+    # --- UI operations
+    def _attachment_pixmap_full(self) -> Optional[QPixmap]:
+        if not self.attach_data or not self.attach_mime:
+            return None
+        if self.attach_mime in ("image/jpeg", "image/png"):
+            return pixmap_from_image_bytes(self.attach_data, QSize(0, 0))
+        return None
+
+    def on_attachment_clicked(self):
+        if not self.has_attachment():
+            return
+        if not self.attach_data:
+            QMessageBox.warning(self.owner, "Attachment", "Attachment is not loaded in memory.")
+            return
+        if self.attach_mime == "application/pdf":
+            self._download_attachment()
+        else:
+            self._open_attachment_viewer()
+
+    def _open_attachment_viewer(self):
+        pixmap = self._attachment_pixmap_full()
+        if not pixmap or pixmap.isNull():
+            QMessageBox.information(self.owner, "Attachment", "Preview is not available for this file.")
+            return
+        dlg = AttachmentViewerDialog(pixmap, self.attach_name or "Attachment", self.attach_data, self.attach_name, self.owner)
+        dlg.show()
+
+    def _download_attachment(self):
+        if not self.attach_data:
+            QMessageBox.warning(self.owner, "Attachment", "Attachment data is missing.")
+            return
+        default = self.attach_name or "attachment"
+        if self.attach_mime == "application/pdf" and not default.lower().endswith(".pdf"):
+            default += ".pdf"
+        path, _ = QFileDialog.getSaveFileName(self.owner, "Save attachment", default)
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(self.attach_data)
+            QMessageBox.information(self.owner, "Saved", "Attachment saved.")
+        except Exception as e:
+            QMessageBox.critical(self.owner, "Save failed", str(e))
+
+    def on_select_attachment(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self.owner,
+            "Select attachment",
+            "",
+            "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
+        )
+        if not path:
+            return
+        mime = guess_mime_from_path(path)
+        if mime not in ALLOWED_MIME:
+            QMessageBox.warning(self.owner, "Invalid file", "Only JPG, PNG, or PDF files are allowed.")
+            return
+        size = os.path.getsize(path)
+        if size > ATTACH_MAX_BYTES:
+            QMessageBox.warning(self.owner, "File too large", "File must be 10MB or smaller.")
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            QMessageBox.critical(self.owner, "Error", f"Failed to read file: {e}")
+            return
+
+        self.attach_data = data
+        self.attach_mime = mime
+        self.attach_name = os.path.basename(path)
+        self.attach_deleted = False
+        self.update_preview()
+
+    def on_remove_attachment(self):
+        self.attach_data = None
+        self.attach_mime = None
+        self.attach_name = None
+        self.attach_deleted = True
+        self.attach_existing_present = False
+        self.update_preview()
+
+    def update_preview(self):
+        max_size = QSize(300, 200)
+        has_attachment = self.has_attachment()
+        pixmap: Optional[QPixmap] = None
+        if has_attachment and self.attach_data and self.attach_mime:
+            if self.attach_mime in ("image/jpeg", "image/png"):
+                pixmap = pixmap_from_image_bytes(self.attach_data, max_size)
+            elif self.attach_mime == "application/pdf":
+                pixmap = pixmap_from_pdf_bytes(self.attach_data, max_size)
+
+        self.preview.setVisible(has_attachment)
+        if has_attachment:
+            if pixmap:
+                self.preview.setPixmap(pixmap)
+                self.preview.setScaledContents(False)
+                self.preview.setText("")
+            else:
+                self.preview.setPixmap(QPixmap())
+                msg = "Preview not available"
+                if self.attach_mime == "application/pdf":
+                    msg = "PDF attached - click to download"
+                self.preview.setText(msg)
+        else:
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("")
+
+        self.preview.setCursor(Qt.PointingHandCursor if has_attachment else Qt.ArrowCursor)
+        if has_attachment:
+            if self.attach_mime == "application/pdf":
+                self.preview.setToolTip("Click to download the PDF attachment")
+            else:
+                self.preview.setToolTip("Click to view the attachment in a larger window")
+        else:
+            self.preview.setToolTip("")
+
+        name_text = self.attach_name if self.attach_name else "None"
+        if self.attach_deleted:
+            name_text += " (removed)"
+        self.name_lbl.setText(name_text)
+        self.remove_btn.setEnabled(
+            not self.view_mode and (self.attach_data is not None or self.attach_existing_present or self.attach_deleted)
+        )
+
+
 class JournalCardList(QWidget):
     def __init__(self, repo: Repo, mode: str, account_code: Optional[str] = None, parent=None):
         super().__init__(parent)
@@ -2156,23 +2433,9 @@ class ExpenseJournalDetailDialog(QDialog):
         self.date.setCalendarPopup(True)
         self.date.setDate(QDate.currentDate())
         self.store = QLineEdit()
-        self.note = QTextEdit()
-        self.note.setFixedHeight(70)
-        self.note_add_btn = QPushButton("Add note")
-        self.note_add_btn.clicked.connect(self._show_note_field)
-        self.note_shown_with_empty = False
-        self.note.textChanged.connect(self._update_note_visibility)
-        note_wrap = QVBoxLayout()
-        note_wrap.setContentsMargins(0, 0, 0, 0)
-        note_wrap.addWidget(self.note)
-        note_wrap.addWidget(self.note_add_btn, alignment=Qt.AlignLeft)
-        note_wrap_widget = QWidget()
-        note_wrap_widget.setLayout(note_wrap)
-        self.attach_data: Optional[bytes] = None
-        self.attach_mime: Optional[str] = None
-        self.attach_name: Optional[str] = None
-        self.attach_deleted: bool = False
-        self.attach_existing_present: bool = False
+
+        self.note_section = NoteFieldSection(self)
+        note_wrap_widget = self.note_section.wrap_widget()
 
         self.currency = QLineEdit()
         self.currency.setPlaceholderText(self.dom)
@@ -2187,7 +2450,7 @@ class ExpenseJournalDetailDialog(QDialog):
         form.addRow("Store", self.store)
         form.addRow("Currency", self.currency)
         form.addRow("Payment account", self.payment)
-        self._build_attachment_ui(form)
+        self.attach_section = AttachmentSection(self, form)
         form.addRow("Note", note_wrap_widget)
         root.addLayout(form)
 
@@ -2226,8 +2489,8 @@ class ExpenseJournalDetailDialog(QDialog):
         self.cat_map: Dict[str, str] = {}
         self._load_categories()
         self._refresh_original_amount_header(self.currency.text())
-        self._update_attachment_preview()
-        self._update_note_visibility()
+        self.attach_section.set_view_mode(self.view_mode)
+        self.note_section.set_view_mode(self.view_mode)
 
         if self.is_new:
             self.btn_edit.setVisible(False)
@@ -2245,99 +2508,6 @@ class ExpenseJournalDetailDialog(QDialog):
         self.cat_map.clear()
         for r in self.repo.list_expense_categories():
             self.cat_map[r["account_name"]] = r["account_code"]
-
-    def _build_attachment_ui(self, form: QFormLayout):
-        self.attach_preview = ClickableLabel("No attachment")
-        self.attach_preview.setAlignment(Qt.AlignLeft)
-        self.attach_preview.setMinimumSize(240, 160)
-        self.attach_preview.setMaximumSize(320, 220)
-        self.attach_preview.setStyleSheet("border: 1px solid #ccc; background: #fafafa;")
-        self.attach_preview.clicked.connect(self.on_attachment_clicked)
-
-        self.attach_name_lbl = QLabel("None")
-        self.attach_name_lbl.setStyleSheet("color: #666;")
-
-        self.attach_add_btn = QPushButton("Add / Replace")
-        self.attach_remove_btn = QPushButton("Remove")
-        self.attach_add_btn.clicked.connect(self.on_select_attachment)
-        self.attach_remove_btn.clicked.connect(self.on_remove_attachment)
-
-        btns = QHBoxLayout()
-        btns.addWidget(self.attach_add_btn)
-        btns.addWidget(self.attach_remove_btn)
-        btns.addStretch(1)
-
-        container = QVBoxLayout()
-        container.setContentsMargins(0, 0, 0, 0)
-        container.addWidget(self.attach_preview)
-        container.addWidget(self.attach_name_lbl)
-        container.addLayout(btns)
-
-        wrap = QWidget()
-        wrap.setLayout(container)
-        wrap.setContentsMargins(0, 0, 0, 0)
-        form.addRow("Attachment", wrap)
-
-    def _has_attachment(self) -> bool:
-        return (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
-
-    def _attachment_pixmap_full(self) -> Optional[QPixmap]:
-        if not self.attach_data or not self.attach_mime:
-            return None
-        if self.attach_mime in ("image/jpeg", "image/png"):
-            return pixmap_from_image_bytes(self.attach_data, QSize(0, 0))
-        return None
-
-    def _open_attachment_viewer(self):
-        pixmap = self._attachment_pixmap_full()
-        if not pixmap or pixmap.isNull():
-            QMessageBox.information(self, "Attachment", "Preview is not available for this file.")
-            return
-        dlg = AttachmentViewerDialog(pixmap, self.attach_name or "Attachment", self.attach_data, self.attach_name, self)
-        dlg.show()
-
-    def _download_attachment(self):
-        if not self.attach_data:
-            QMessageBox.warning(self, "Attachment", "Attachment data is missing.")
-            return
-        default = self.attach_name or "attachment"
-        if self.attach_mime == "application/pdf" and not default.lower().endswith(".pdf"):
-            default += ".pdf"
-        path, _ = QFileDialog.getSaveFileName(self, "Save attachment", default)
-        if not path:
-            return
-        try:
-            with open(path, "wb") as f:
-                f.write(self.attach_data)
-            QMessageBox.information(self, "Saved", "Attachment saved.")
-        except Exception as e:
-            QMessageBox.critical(self, "Save failed", str(e))
-
-    def on_attachment_clicked(self):
-        if not self._has_attachment():
-            return
-        if not self.attach_data:
-            QMessageBox.warning(self, "Attachment", "Attachment is not loaded in memory.")
-            return
-        if self.attach_mime == "application/pdf":
-            self._download_attachment()
-        else:
-            self._open_attachment_viewer()
-
-    def _show_note_field(self):
-        if self.view_mode:
-            return
-        self.note_shown_with_empty = True
-        self._update_note_visibility()
-        self.note.setFocus()
-
-    def _update_note_visibility(self):
-        has_text = bool(self.note.toPlainText().strip())
-        if has_text:
-            self.note_shown_with_empty = False
-        show_note = has_text or self.note_shown_with_empty
-        self.note.setVisible(show_note)
-        self.note_add_btn.setVisible(not show_note)
 
     def _refresh_original_amount_header(self, ccy: str):
         ccy = (ccy or "").strip().upper()
@@ -2366,22 +2536,19 @@ class ExpenseJournalDetailDialog(QDialog):
 
     def set_view_mode(self):
         self.view_mode = True
-        for w in [self.date, self.store, self.note, self.currency, self.payment, self.note_add_btn]:
+        for w in [self.date, self.store, self.currency, self.payment]:
             w.setEnabled(False)
         self.table.setEnabled(False)
         self.btn_save.setEnabled(False)
         self.btn_add_line.setEnabled(False)
         self.btn_delete.setEnabled(True)
         self.btn_edit.setEnabled(True)
-        self.attach_add_btn.setEnabled(False)
-        self.attach_remove_btn.setEnabled(False)
-        self._update_attachment_preview()
-        self.note_shown_with_empty = False
-        self._update_note_visibility()
+        self.attach_section.set_view_mode(True)
+        self.note_section.set_view_mode(True)
 
     def set_edit_mode(self):
         self.view_mode = False
-        for w in [self.date, self.store, self.note, self.currency, self.payment, self.note_add_btn]:
+        for w in [self.date, self.store, self.currency, self.payment]:
             w.setEnabled(True)
         self.table.setEnabled(True)
         self.btn_save.setEnabled(True)
@@ -2389,91 +2556,8 @@ class ExpenseJournalDetailDialog(QDialog):
         self.btn_delete.setEnabled(True)
         self.btn_edit.setEnabled(False)
         self.btn_cancel.setText("Cancel")
-        self.attach_add_btn.setEnabled(True)
-        self.attach_remove_btn.setEnabled(True)
-        self._update_attachment_preview()
-        self._update_note_visibility()
-
-    def _update_attachment_preview(self):
-        max_size = QSize(300, 200)
-        has_attachment = self._has_attachment()
-        pixmap: Optional[QPixmap] = None
-        if has_attachment and self.attach_data and self.attach_mime:
-            if self.attach_mime in ("image/jpeg", "image/png"):
-                pixmap = pixmap_from_image_bytes(self.attach_data, max_size)
-            elif self.attach_mime == "application/pdf":
-                pixmap = pixmap_from_pdf_bytes(self.attach_data, max_size)
-
-        self.attach_preview.setVisible(has_attachment)
-        if has_attachment:
-            if pixmap:
-                self.attach_preview.setPixmap(pixmap)
-                self.attach_preview.setScaledContents(False)
-                self.attach_preview.setText("")
-            else:
-                self.attach_preview.setPixmap(QPixmap())
-                msg = "Preview not available"
-                if self.attach_mime == "application/pdf":
-                    msg = "PDF attached - click to download"
-                self.attach_preview.setText(msg)
-        else:
-            self.attach_preview.setPixmap(QPixmap())
-            self.attach_preview.setText("")
-
-        self.attach_preview.setCursor(Qt.PointingHandCursor if has_attachment else Qt.ArrowCursor)
-        if has_attachment:
-            if self.attach_mime == "application/pdf":
-                self.attach_preview.setToolTip("Click to download the PDF attachment")
-            else:
-                self.attach_preview.setToolTip("Click to view the attachment in a larger window")
-        else:
-            self.attach_preview.setToolTip("")
-
-        name_text = self.attach_name if self.attach_name else "None"
-        if self.attach_deleted:
-            name_text += " (removed)"
-        self.attach_name_lbl.setText(name_text)
-        self.attach_remove_btn.setEnabled(
-            not self.view_mode and (self.attach_data is not None or self.attach_existing_present or self.attach_deleted)
-        )
-
-    def on_select_attachment(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select attachment",
-            "",
-            "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
-        )
-        if not path:
-            return
-        mime = guess_mime_from_path(path)
-        if mime not in ALLOWED_MIME:
-            QMessageBox.warning(self, "Invalid file", "Only JPG, PNG, or PDF files are allowed.")
-            return
-        size = os.path.getsize(path)
-        if size > ATTACH_MAX_BYTES:
-            QMessageBox.warning(self, "File too large", "File must be 10MB or smaller.")
-            return
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
-            return
-
-        self.attach_data = data
-        self.attach_mime = mime
-        self.attach_name = os.path.basename(path)
-        self.attach_deleted = False
-        self._update_attachment_preview()
-
-    def on_remove_attachment(self):
-        self.attach_data = None
-        self.attach_mime = None
-        self.attach_name = None
-        self.attach_deleted = True
-        self.attach_existing_present = False
-        self._update_attachment_preview()
+        self.attach_section.set_view_mode(False)
+        self.note_section.set_edit_mode()
 
     def add_line(self):
         row = self.table.rowCount()
@@ -2517,27 +2601,14 @@ class ExpenseJournalDetailDialog(QDialog):
 
         self.date.setDate(iso_to_qdate(h["accounting_date"]))
         self.store.setText(h["entry_title"] or "")
-        self.note.setPlainText(h["entry_text"] or "")
-        self._update_note_visibility()
+        self.note_section.set_text(h["entry_text"] or "")
 
         items = self.repo.get_entry_items(self.entry_uuid)
         if items:
             self.currency.setText(items[0]["currency_original"])
 
         att = self.repo.get_attachment(self.entry_uuid)
-        if att:
-            self.attach_data = att["file_blob"]
-            self.attach_mime = att["mime_type"]
-            self.attach_name = att["file_name"]
-            self.attach_deleted = False
-            self.attach_existing_present = True
-        else:
-            self.attach_data = None
-            self.attach_mime = None
-            self.attach_name = None
-            self.attach_deleted = False
-            self.attach_existing_present = False
-        self._update_attachment_preview()
+        self.attach_section.load_existing(att)
 
         pay_code = None
         for it in items:
@@ -2622,22 +2693,11 @@ class ExpenseJournalDetailDialog(QDialog):
         })
         return items
 
-    def _save_attachment(self):
-        if not self.entry_uuid:
-            return
-        if self.attach_data and self.attach_mime:
-            self.repo.upsert_attachment(self.entry_uuid, self.attach_name, self.attach_mime, self.attach_data)
-            self.attach_existing_present = True
-            self.attach_deleted = False
-        elif self.attach_deleted or self.attach_existing_present:
-            self.repo.delete_attachment(self.entry_uuid)
-            self.attach_existing_present = False
-
     def on_save(self):
         try:
             accounting_date = qdate_to_iso(self.date.date())
             entry_title = self.store.text().strip() or None
-            entry_text = self.note.toPlainText().strip() or None
+            entry_text = self.note_section.text().strip() or None
 
             if self.is_new:
                 self.entry_uuid = new_uuid()
@@ -2654,7 +2714,7 @@ class ExpenseJournalDetailDialog(QDialog):
                 is_new=self.is_new,
             )
             self.is_new = False
-            self._save_attachment()
+            self.attach_section.save(self.repo, self.entry_uuid)
             QMessageBox.information(self, "Saved", "Entry saved.")
             self.accept()
         except Exception as e:
@@ -2695,27 +2755,12 @@ class GeneralJournalDetailDialog(QDialog):
         self.date.setCalendarPopup(True)
         self.date.setDate(QDate.currentDate())
         self.title = QLineEdit()
-        self.note = QTextEdit()
-        self.note.setFixedHeight(70)
-        self.note_add_btn = QPushButton("Add note")
-        self.note_add_btn.clicked.connect(self._show_note_field)
-        self.note_shown_with_empty = False
-        self.note.textChanged.connect(self._update_note_visibility)
-        note_wrap = QVBoxLayout()
-        note_wrap.setContentsMargins(0, 0, 0, 0)
-        note_wrap.addWidget(self.note)
-        note_wrap.addWidget(self.note_add_btn, alignment=Qt.AlignLeft)
-        note_wrap_widget = QWidget()
-        note_wrap_widget.setLayout(note_wrap)
-        self.attach_data: Optional[bytes] = None
-        self.attach_mime: Optional[str] = None
-        self.attach_name: Optional[str] = None
-        self.attach_deleted: bool = False
-        self.attach_existing_present: bool = False
+        self.note_section = NoteFieldSection(self)
+        note_wrap_widget = self.note_section.wrap_widget()
         form.addRow("Type", self.entry_type)
         form.addRow("Date", self.date)
         form.addRow("Title (Vendor)", self.title)
-        self._build_attachment_ui(form)
+        self.attach_section = AttachmentSection(self, form)
         form.addRow("Note", note_wrap_widget)
         root.addLayout(form)
 
@@ -2753,8 +2798,8 @@ class GeneralJournalDetailDialog(QDialog):
 
         self.accounts = self.repo.list_accounts("is_active=1")
         self.account_map = {r["account_name"]: r["account_code"] for r in self.accounts}
-        self._update_attachment_preview()
-        self._update_note_visibility()
+        self.attach_section.set_view_mode(self.view_mode)
+        self.note_section.set_view_mode(self.view_mode)
 
         if self.is_new:
             self.btn_edit.setVisible(False)
@@ -2769,117 +2814,25 @@ class GeneralJournalDetailDialog(QDialog):
             else:
                 self.set_view_mode()
 
-    def _build_attachment_ui(self, form: QFormLayout):
-        self.attach_preview = ClickableLabel("No attachment")
-        self.attach_preview.setAlignment(Qt.AlignLeft)
-        self.attach_preview.setMinimumSize(240, 160)
-        self.attach_preview.setMaximumSize(320, 220)
-        self.attach_preview.setStyleSheet("border: 1px solid #ccc; background: #fafafa;")
-        self.attach_preview.clicked.connect(self.on_attachment_clicked)
-
-        self.attach_name_lbl = QLabel("None")
-        self.attach_name_lbl.setStyleSheet("color: #666;")
-
-        self.attach_add_btn = QPushButton("Add / Replace")
-        self.attach_remove_btn = QPushButton("Remove")
-        self.attach_add_btn.clicked.connect(self.on_select_attachment)
-        self.attach_remove_btn.clicked.connect(self.on_remove_attachment)
-
-        btns = QHBoxLayout()
-        btns.addWidget(self.attach_add_btn)
-        btns.addWidget(self.attach_remove_btn)
-        btns.addStretch(1)
-
-        container = QVBoxLayout()
-        container.setContentsMargins(0, 0, 0, 0)
-        container.addWidget(self.attach_preview)
-        container.addWidget(self.attach_name_lbl)
-        container.addLayout(btns)
-
-        wrap = QWidget()
-        wrap.setLayout(container)
-        wrap.setContentsMargins(0, 0, 0, 0)
-        form.addRow("Attachment", wrap)
-
-    def _has_attachment(self) -> bool:
-        return (self.attach_data is not None or self.attach_existing_present) and not self.attach_deleted
-
-    def _attachment_pixmap_full(self) -> Optional[QPixmap]:
-        if not self.attach_data or not self.attach_mime:
-            return None
-        if self.attach_mime in ("image/jpeg", "image/png"):
-            return pixmap_from_image_bytes(self.attach_data, QSize(0, 0))
-        return None
-
-    def _open_attachment_viewer(self):
-        pixmap = self._attachment_pixmap_full()
-        if not pixmap or pixmap.isNull():
-            QMessageBox.information(self, "Attachment", "Preview is not available for this file.")
-            return
-        dlg = AttachmentViewerDialog(pixmap, self.attach_name or "Attachment", self.attach_data, self.attach_name, self)
-        dlg.show()
-
-    def _download_attachment(self):
-        if not self.attach_data:
-            QMessageBox.warning(self, "Attachment", "Attachment data is missing.")
-            return
-        default = self.attach_name or "attachment"
-        if self.attach_mime == "application/pdf" and not default.lower().endswith(".pdf"):
-            default += ".pdf"
-        path, _ = QFileDialog.getSaveFileName(self, "Save attachment", default)
-        if not path:
-            return
-        try:
-            with open(path, "wb") as f:
-                f.write(self.attach_data)
-            QMessageBox.information(self, "Saved", "Attachment saved.")
-        except Exception as e:
-            QMessageBox.critical(self, "Save failed", str(e))
-
+    # Attachment click is handled inside AttachmentSection; keep stub for backward safety.
     def on_attachment_clicked(self):
-        if not self._has_attachment():
-            return
-        if not self.attach_data:
-            QMessageBox.warning(self, "Attachment", "Attachment is not loaded in memory.")
-            return
-        if self.attach_mime == "application/pdf":
-            self._download_attachment()
-        else:
-            self._open_attachment_viewer()
-
-    def _show_note_field(self):
-        if self.view_mode:
-            return
-        self.note_shown_with_empty = True
-        self._update_note_visibility()
-        self.note.setFocus()
-
-    def _update_note_visibility(self):
-        has_text = bool(self.note.toPlainText().strip())
-        if has_text:
-            self.note_shown_with_empty = False
-        show_note = has_text or self.note_shown_with_empty
-        self.note.setVisible(show_note)
-        self.note_add_btn.setVisible(not show_note)
+        self.attach_section.on_attachment_clicked()
 
     def set_view_mode(self):
         self.view_mode = True
-        for w in [self.entry_type, self.date, self.title, self.note, self.note_add_btn]:
+        for w in [self.entry_type, self.date, self.title]:
             w.setEnabled(False)
         self.table.setEnabled(False)
         self.btn_save.setEnabled(False)
         self.btn_add_line.setEnabled(False)
         self.btn_delete.setEnabled(True)
         self.btn_edit.setEnabled(True)
-        self.attach_add_btn.setEnabled(False)
-        self.attach_remove_btn.setEnabled(False)
-        self._update_attachment_preview()
-        self.note_shown_with_empty = False
-        self._update_note_visibility()
+        self.attach_section.set_view_mode(True)
+        self.note_section.set_view_mode(True)
 
     def set_edit_mode(self):
         self.view_mode = False
-        for w in [self.entry_type, self.date, self.title, self.note, self.note_add_btn]:
+        for w in [self.entry_type, self.date, self.title]:
             w.setEnabled(True)
         self.table.setEnabled(True)
         self.btn_save.setEnabled(True)
@@ -2887,91 +2840,8 @@ class GeneralJournalDetailDialog(QDialog):
         self.btn_delete.setEnabled(True)
         self.btn_edit.setEnabled(False)
         self.btn_cancel.setText("Cancel")
-        self.attach_add_btn.setEnabled(True)
-        self.attach_remove_btn.setEnabled(True)
-        self._update_attachment_preview()
-        self._update_note_visibility()
-
-    def _update_attachment_preview(self):
-        max_size = QSize(300, 200)
-        has_attachment = self._has_attachment()
-        pixmap: Optional[QPixmap] = None
-        if has_attachment and self.attach_data and self.attach_mime:
-            if self.attach_mime in ("image/jpeg", "image/png"):
-                pixmap = pixmap_from_image_bytes(self.attach_data, max_size)
-            elif self.attach_mime == "application/pdf":
-                pixmap = pixmap_from_pdf_bytes(self.attach_data, max_size)
-
-        self.attach_preview.setVisible(has_attachment)
-        if has_attachment:
-            if pixmap:
-                self.attach_preview.setPixmap(pixmap)
-                self.attach_preview.setScaledContents(False)
-                self.attach_preview.setText("")
-            else:
-                self.attach_preview.setPixmap(QPixmap())
-                msg = "Preview not available"
-                if self.attach_mime == "application/pdf":
-                    msg = "PDF attached - click to download"
-                self.attach_preview.setText(msg)
-        else:
-            self.attach_preview.setPixmap(QPixmap())
-            self.attach_preview.setText("")
-
-        self.attach_preview.setCursor(Qt.PointingHandCursor if has_attachment else Qt.ArrowCursor)
-        if has_attachment:
-            if self.attach_mime == "application/pdf":
-                self.attach_preview.setToolTip("Click to download the PDF attachment")
-            else:
-                self.attach_preview.setToolTip("Click to view the attachment in a larger window")
-        else:
-            self.attach_preview.setToolTip("")
-
-        name_text = self.attach_name if self.attach_name else "None"
-        if self.attach_deleted:
-            name_text += " (removed)"
-        self.attach_name_lbl.setText(name_text)
-        self.attach_remove_btn.setEnabled(
-            not self.view_mode and (self.attach_data is not None or self.attach_existing_present or self.attach_deleted)
-        )
-
-    def on_select_attachment(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select attachment",
-            "",
-            "Images/PDF (*.jpg *.jpeg *.png *.pdf)"
-        )
-        if not path:
-            return
-        mime = guess_mime_from_path(path)
-        if mime not in ALLOWED_MIME:
-            QMessageBox.warning(self, "Invalid file", "Only JPG, PNG, or PDF files are allowed.")
-            return
-        size = os.path.getsize(path)
-        if size > ATTACH_MAX_BYTES:
-            QMessageBox.warning(self, "File too large", "File must be 10MB or smaller.")
-            return
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to read file: {e}")
-            return
-
-        self.attach_data = data
-        self.attach_mime = mime
-        self.attach_name = os.path.basename(path)
-        self.attach_deleted = False
-        self._update_attachment_preview()
-
-    def on_remove_attachment(self):
-        self.attach_data = None
-        self.attach_mime = None
-        self.attach_name = None
-        self.attach_deleted = True
-        self.attach_existing_present = False
-        self._update_attachment_preview()
+        self.attach_section.set_view_mode(False)
+        self.note_section.set_edit_mode()
 
     def add_line(self):
         row = self.table.rowCount()
@@ -3027,23 +2897,10 @@ class GeneralJournalDetailDialog(QDialog):
         self.entry_type.setCurrentText(h["entry_type"])
         self.date.setDate(iso_to_qdate(h["accounting_date"]))
         self.title.setText(h["entry_title"] or "")
-        self.note.setPlainText(h["entry_text"] or "")
-        self._update_note_visibility()
+        self.note_section.set_text(h["entry_text"] or "")
 
         att = self.repo.get_attachment(self.entry_uuid)
-        if att:
-            self.attach_data = att["file_blob"]
-            self.attach_mime = att["mime_type"]
-            self.attach_name = att["file_name"]
-            self.attach_deleted = False
-            self.attach_existing_present = True
-        else:
-            self.attach_data = None
-            self.attach_mime = None
-            self.attach_name = None
-            self.attach_deleted = False
-            self.attach_existing_present = False
-        self._update_attachment_preview()
+        self.attach_section.load_existing(att)
 
         items = self.repo.get_entry_items(self.entry_uuid)
         self.table.setRowCount(0)
@@ -3111,23 +2968,12 @@ class GeneralJournalDetailDialog(QDialog):
             raise ValueError("Add at least one line with non-zero amount")
         return items
 
-    def _save_attachment(self):
-        if not self.entry_uuid:
-            return
-        if self.attach_data and self.attach_mime:
-            self.repo.upsert_attachment(self.entry_uuid, self.attach_name, self.attach_mime, self.attach_data)
-            self.attach_existing_present = True
-            self.attach_deleted = False
-        elif self.attach_deleted or self.attach_existing_present:
-            self.repo.delete_attachment(self.entry_uuid)
-            self.attach_existing_present = False
-
     def on_save(self):
         try:
             accounting_date = qdate_to_iso(self.date.date())
             entry_type = self.entry_type.currentText()
             title = self.title.text().strip() or None
-            note = self.note.toPlainText().strip() or None
+            note = self.note_section.text().strip() or None
 
             if self.is_new:
                 self.entry_uuid = new_uuid()
@@ -3144,7 +2990,7 @@ class GeneralJournalDetailDialog(QDialog):
                 is_new=self.is_new,
             )
             self.is_new = False
-            self._save_attachment()
+            self.attach_section.save(self.repo, self.entry_uuid)
             QMessageBox.information(self, "Saved", "Entry saved.")
             self.accept()
         except Exception as e:
@@ -3291,35 +3137,45 @@ class BalanceSheetAccountDetailDialog(QDialog):
     def refresh(self):
         self.list.clear()
         rows = self.repo.list_user_managed_bs_accounts()
-        last_type = None
+        current_section = None
         for r in rows:
-            t = r["account_type"]
-            if t != last_type:
-                self.list.addItem(SectionHeaderItem(ACCOUNT_TYPE_LABEL.get(t, t)))
-                last_type = t
+            is_active = int(r["is_active"])
+            if is_active == 0:
+                section = "Inactive"
+            else:
+                section = ACCOUNT_TYPE_LABEL.get(r["account_type"], r["account_type"])
+
+            if section != current_section:
+                self.list.addItem(SectionHeaderItem(section))
+                current_section = section
 
             payload = {
                 "kind": "row",
                 "account_code": r["account_code"],
                 "account_name": r["account_name"],
-                "account_type": t,
-                "is_active": int(r["is_active"]),
+                "account_type": r["account_type"],
+                "is_active": is_active,
             }
             item = CardRowItem(payload)
             self.list.addItem(item)
 
             w = QWidget()
             lay = QHBoxLayout(w)
-            lay.setContentsMargins(12, 8, 12, 8)
-            lay.setSpacing(12)
+            lay.setContentsMargins(10, 8, 10, 8)
+            lay.setSpacing(10)
 
-            icon = QLabel(bs_icon(r["account_code"], t))
-            icon.setFixedWidth(28)
+            icon = QLabel(bs_icon(r["account_code"], r["account_type"]))
+            icon.setFixedWidth(24)
             icon.setAlignment(Qt.AlignCenter)
 
             text_col = QVBoxLayout()
+            text_col.setContentsMargins(0, 0, 0, 0)
+            text_col.setSpacing(2)
             name_lbl = QLabel(r["account_name"])
-            type_lbl = QLabel(ACCOUNT_TYPE_LABEL.get(t, t))
+            name_lbl.setWordWrap(False)
+            name_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            name_lbl.setMinimumWidth(200)
+            type_lbl = QLabel(ACCOUNT_TYPE_LABEL.get(r["account_type"], r["account_type"]))
             type_lbl.setStyleSheet("color: #666; font-size: 12px;")
             text_col.addWidget(name_lbl)
             text_col.addWidget(type_lbl)
@@ -3329,14 +3185,22 @@ class BalanceSheetAccountDetailDialog(QDialog):
                 active_lbl.setStyleSheet("color: #0a7a0a;")
             else:
                 active_lbl.setStyleSheet("color: #a00;")
+            active_lbl.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
 
             edit_btn = QPushButton("Edit")
+            edit_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             edit_btn.clicked.connect(lambda _, code=r["account_code"]: self.edit_account(code))
 
             lay.addWidget(icon)
             lay.addLayout(text_col, 1)
-            lay.addWidget(active_lbl)
-            lay.addWidget(edit_btn)
+            lay.addStretch(1)
+
+            right_col = QVBoxLayout()
+            right_col.setContentsMargins(0, 0, 0, 0)
+            right_col.setSpacing(6)
+            right_col.addWidget(active_lbl, alignment=Qt.AlignRight | Qt.AlignVCenter)
+            right_col.addWidget(edit_btn, alignment=Qt.AlignRight | Qt.AlignVCenter)
+            lay.addLayout(right_col)
 
             self.list.setItemWidget(item, w)
             item.setSizeHint(QSize(10, 64))
@@ -3370,7 +3234,11 @@ class InsightHome(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
 
-        seg = QHBoxLayout()
+        seg_container = QWidget()
+        seg_container.setObjectName("InsightSegmentContainer")
+        seg = QHBoxLayout(seg_container)
+        seg.setContentsMargins(0, 0, 0, 0)
+        seg.setSpacing(8)
         self.btn_expense = QPushButton("My Expenses")
         self.btn_bs = QPushButton("My Accounts")
         self.btn_exp_trend = QPushButton("Expense Trend")
@@ -3386,6 +3254,7 @@ class InsightHome(QWidget):
                 border: 2px solid #6e1d16;
                 border-radius: 14px;
                 padding: 1px 14px;
+                margin: 0;
                 font-weight: 600;
             }
             QPushButton:checked {
@@ -3404,7 +3273,31 @@ class InsightHome(QWidget):
             btn.setStyleSheet(segment_style)
             seg.addWidget(btn)
         seg.addStretch(1)
-        root.addLayout(seg)
+
+        seg_scroll = QScrollArea()
+        seg_scroll.setWidget(seg_container)
+        seg_scroll.setWidgetResizable(False)
+        seg_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        seg_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        seg_scroll.setFrameShape(QFrame.NoFrame)
+        seg_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        seg_scroll.setContentsMargins(0, 0, 0, 0)
+        seg_scroll.setViewportMargins(0, 0, 0, 0)
+        seg_scroll.setFixedHeight(self.btn_expense.sizeHint().height() + 20)
+        seg_scroll.setStyleSheet(
+            """
+            QScrollArea {
+                background: #f2e4c7;
+                border: none;
+            }
+            QScrollArea > QWidget {
+                background: #f2e4c7;
+            }
+            """
+        )
+        seg_container.setStyleSheet("background: #f2e4c7;")
+        QScroller.grabGesture(seg_scroll.viewport(), QScroller.LeftMouseButtonGesture)
+        root.addWidget(seg_scroll)
 
         nav = QHBoxLayout()
         self.back = QToolButton()
@@ -3419,6 +3312,26 @@ class InsightHome(QWidget):
         nav.addWidget(self.back)
         nav.addWidget(self.title)
         nav.addStretch(1)
+        self.btn_manage_accounts = QToolButton()
+        self.btn_manage_accounts.setText("⚙️")
+        self.btn_manage_accounts.setCursor(Qt.PointingHandCursor)
+        self.btn_manage_accounts.setToolTip("Manage accounts")
+        self.btn_manage_accounts.setStyleSheet(
+            """
+            QToolButton {
+                background: transparent;
+                border: none;
+                font-size: 16px;
+                padding: 4px 6px;
+            }
+            QToolButton:hover {
+                background: rgba(0, 0, 0, 0.08);
+                border-radius: 10px;
+            }
+            """
+        )
+        self.btn_manage_accounts.clicked.connect(self._manage_accounts)
+        nav.addWidget(self.btn_manage_accounts)
         root.addLayout(nav)
 
         self.stack = QStackedWidget()
@@ -3443,6 +3356,7 @@ class InsightHome(QWidget):
         self.btn_exp_trend.clicked.connect(lambda: self.switch_root(2))
         self.btn_assets_trend.clicked.connect(lambda: self.switch_root(3))
         self._set_segment_checked(0)
+        self._update_manage_button()
 
     def _set_segment_checked(self, idx: int):
         self.btn_expense.setChecked(idx == 0)
@@ -3458,6 +3372,7 @@ class InsightHome(QWidget):
         titles = ["My Expenses", "My Accounts", "Expense Trend", "Assets Trend"]
         self.title.setText(titles[idx] if 0 <= idx < len(titles) else "")
         self.refresh_current()
+        self._update_manage_button()
 
     def refresh_current(self):
         w = self.stack.currentWidget()
@@ -3479,6 +3394,7 @@ class InsightHome(QWidget):
         self.title.setText(title)
         self.back.setEnabled(len(self.nav_stack) > 0)
         self.refresh_current()
+        self._update_manage_button()
 
     def open_entry_general(self, entry_uuid: str):
         dlg = GeneralJournalDetailDialog(self.repo, entry_uuid=entry_uuid, parent=self)
@@ -3496,6 +3412,7 @@ class InsightHome(QWidget):
         self.stack.addWidget(page)
         self.stack.setCurrentWidget(page)
         self.title.setText(account_name)
+        self._update_manage_button()
 
     def refresh_all(self):
         self.page_expense.refresh()
@@ -3503,6 +3420,16 @@ class InsightHome(QWidget):
         self.page_exp_trend.refresh()
         self.page_assets_trend.refresh()
         self.refresh_current()
+        self._update_manage_button()
+
+    def _manage_accounts(self):
+        win = self.window()
+        if hasattr(win, "manage_accounts"):
+            win.manage_accounts()
+
+    def _update_manage_button(self):
+        show = self.stack.currentIndex() == 1 and not self.nav_stack
+        self.btn_manage_accounts.setVisible(show)
 
 
 class MainWindow(QMainWindow):
