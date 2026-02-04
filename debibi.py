@@ -1232,7 +1232,7 @@ class GeminiClient:
             try:
                 return self._parse_json_text(retry_text)
             except Exception as e2:
-                raise GeminiClientError(f"Failed to parse JSON from Gemini. Raw response:\n{retry_text}") from e2
+                raise GeminiClientError(f"Failed to parse JSON from Gemini. Raw response (Saved to ./log/):\n{retry_text}") from e2
 
     def generate_text(
         self,
@@ -1477,6 +1477,19 @@ class AiImportController(QObject):
         self._running_threads: List[QThread] = []
         self._job_ctx: Optional[Dict[str, Any]] = None
         self.log_dir = os.path.join(os.path.dirname(__file__), "log")
+
+    def _save_failed_payload(self, payload: Any):
+        """Persist Gemini payloads when import parsing/validation fails."""
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = os.path.join(self.log_dir, f"{ts}.txt")
+            content = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            # Logging should never break the UI flow
+            pass
 
     def import_from_text(self):
         dlg = FreeTextImportDialog(self.parent_widget)
